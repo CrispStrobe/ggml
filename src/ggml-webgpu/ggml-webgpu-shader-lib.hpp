@@ -1121,6 +1121,10 @@ class ggml_webgpu_shader_lib {
                 defines.push_back("L2_NORM");
                 variant = "l2_norm";
                 break;
+            case GGML_OP_NORM:
+                defines.push_back("NORM");
+                variant = "norm";
+                break;
             default:
                 GGML_ABORT("Unsupported op for row_norm shader");
         }
