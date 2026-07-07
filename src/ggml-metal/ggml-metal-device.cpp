@@ -299,6 +299,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu(ggml_metal_l
                 case GGML_GLU_OP_SWIGLU_OAI:   op_str = "swiglu_oai";   break;
                 case GGML_GLU_OP_GEGLU_ERF:    op_str = "geglu_erf";    break;
                 case GGML_GLU_OP_GEGLU_QUICK:  op_str = "geglu_quick";  break;
+                case GGML_GLU_OP_SIGLU:        op_str = "siglu";        break;
                 default: GGML_ABORT("fatal error");
             } break;
         default: GGML_ABORT("fatal error");
@@ -687,7 +688,38 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
         : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    // CrispASR patch (#83): if the op asks for F32 precision and the F32 input
+    // path is implicated (T1 == F32, legacy half-tile path active), pick the
+    // _hp kernel that keeps F32 in shmem and uses simdgroup_float8x8 tiles.
+    // Mirrors how Vulkan honours GGML_PREC_F32 — Metal mul_mm previously
+    // ignored it. See LEARNINGS §"Root cause located — ggml-metal kernel_mul_mm
+    // legacy path".
+    const enum ggml_prec prec = (enum ggml_prec) ggml_get_op_params_i32(op, 0);
+    const bool prec_f32 = (prec == GGML_PREC_F32);
+    bool use_hp = false;
+    if (prec_f32 && !has_tensor && tsrc1 == GGML_TYPE_F32) {
+        // Only a small subset of weight types is wired up for the _hp path;
+        // others fall through to the half-tile kernel without warning.
+        switch (tsrc0) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_F16:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_Q8_0:
+                use_hp = true;
+                break;
+            default:
+                use_hp = false;
+                break;
+        }
+    }
+
+    if (use_hp) {
+        snprintf(base, 256, "kernel_mul_mm_%s_%s_hp", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    }
     snprintf(name, 256, "%s_bci=%d_bco=%d", base, bc_inp, bc_out);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -712,7 +744,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         res.nr0 = 64;
         res.nr1 = 32;
 
-        res.smem = bc_out ? 8192 : (4096 + 2048);
+        if (use_hp) {
+            // _hp layout: sa = 64*32*sizeof(float) = 8192,
+            //             sb = 32*32*sizeof(float) = 4096,
+            //             total = 12288 (covers temp_str at 8192 too).
+            res.smem = 12288;
+        } else {
+            res.smem = bc_out ? 8192 : (4096 + 2048);
+        }
     }
 
     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
@@ -1728,6 +1767,66 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1
     char name[256];
 
     snprintf(base, 256, "kernel_conv_transpose_1d_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+// CrispASR patch (PR #160 col2im_1d) — MUST RE-APPLY after ggml bump.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_col2im_1d(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_COL2IM_1D);
+
+    GGML_ASSERT(ggml_is_contiguous(op->src[0]));
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_col2im_1d_%s", ggml_type_name(op->src[0]->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+// CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
+// INDEXTTS_AA_METAL_VARIANT selects among three semantically-equivalent
+// Metal kernels for the AA-SnakeBeta op. All three produce numerically-
+// identical output on F32 (verified: WAV rmsdiff == 0). On M1 the default
+// (zero-stuff + 12-tap FIR) measured fastest during the Phase 3 sweep;
+// the variants are kept reachable so the comparison can be re-run on
+// other Apple GPU families (M3, M4, …) without a recompile.
+//
+//   unset / `default` / `v1`     → kernel_aa_snake_beta_f32
+//   `polyphase` / `poly`         → kernel_aa_snake_beta_polyphase_f32
+//   `tgmem` / `tg` / `shared`    → kernel_aa_snake_beta_tgmem_f32
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_aa_snake_beta(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_AA_SNAKE_BETA);
+
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+
+    static const char * variant_name = []() -> const char * {
+        const char * v = getenv("INDEXTTS_AA_METAL_VARIANT");
+        if (!v || !*v)                                                                return "kernel_aa_snake_beta_f32";
+        if (v[0] == 'p' || v[0] == 'P')                                               return "kernel_aa_snake_beta_polyphase_f32";
+        if (v[0] == 't' || v[0] == 'T' || v[0] == 's' || v[0] == 'S')                 return "kernel_aa_snake_beta_tgmem_f32";
+        return "kernel_aa_snake_beta_f32";
+    }();
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "%s", variant_name);
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

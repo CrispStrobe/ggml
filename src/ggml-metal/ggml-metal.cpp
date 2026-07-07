@@ -212,6 +212,13 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
 
     // some operations require additional memory for fleeting data:
     switch (tensor->op) {
+        case GGML_OP_MUL_MAT:
+            {
+                // CrispASR patch (#83): Q8_K-quantised input scratch (Q4_K weights × F32).
+                res += ggml_metal_op_mul_mat_extra_q8_K(tensor);
+                // CrispASR patch (#83 r9): Q8_0-quantised input scratch (Q8_0 weights × F32).
+                res += ggml_metal_op_mul_mat_extra_q8_0(tensor);
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);

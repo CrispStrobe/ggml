@@ -685,14 +685,25 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
     q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
-    const float min = xb->dmin;
+    // CrispASR patch (#83): mirror the CPU `dequantize_row_q4_K` arithmetic
+    // exactly — `d * sc * nibble - dmin * m`, with `nibble = q & 0x0F` (low
+    // half) or `q >> 4` (high half). The legacy version used
+    // `(d/16) * (q & 0xF0)` which is mathematically equivalent but rounds
+    // differently in F32, accumulating ~1e-3 drift on K=1024 dot products
+    // — enough to break chatterbox's multinomial speech-token sampler.
+    const float d   = (float) xb->d;
+    const float min = (float) xb->dmin;
     const float dl = d * sc[0];
     const float ml = min * sc[1];
 
-    const ushort mask = il < 2 ? 0x0F : 0xF0;
-    for (int i = 0; i < 16; ++i) {
-        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
+    if (il < 2) {
+        for (int i = 0; i < 16; ++i) {
+            reg[i/4][i%4] = dl * (float)(q[i] & 0x0F) - ml;
+        }
+    } else {
+        for (int i = 0; i < 16; ++i) {
+            reg[i/4][i%4] = dl * (float)(q[i] >> 4) - ml;
+        }
     }
 }
 
@@ -1552,6 +1563,26 @@ kernel void kernel_geglu_quick_f32(
         const float gelu_quick = x0*(1.0f/(1.0f+exp(GELU_QUICK_COEF*x0)));
 
         dst_row[i0] = gelu_quick*x1;
+    }
+}
+
+kernel void kernel_siglu_f32(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tpitg[[thread_position_in_threadgroup]],
+        uint   ntg[[threads_per_threadgroup]]) {
+    device const float * src0_row = (device const float *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+    device const float * src1_row = (device const float *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+    device       float * dst_row  = (device       float *) ((device       char *) dst  + tgpig*args.nb1);
+
+    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
+        const float x0 = src0_row[i0];
+        const float x1 = src1_row[i0];
+
+        dst_row[i0] = (1.0f / (1.0f + exp(-x0))) * x1;
     }
 }
 
@@ -2885,6 +2916,27 @@ kernel void kernel_argmax_f32(
     dst_i32[tgpig] = arg_val;
 }
 
+// CrispASR patch — explicit per-T reduction helpers for kernel_norm_fuse_impl
+// and kernel_rms_norm_fuse_impl. The original code uses
+// `dot(sumft, T(1.0f))` and `dot(y[i00], y[i00])` with T = float in
+// the kernel_norm_f32 (scalar) instantiation. The Metal Shading
+// Language Specification only defines `dot()` for vector types
+// (float2, float3, float4, half2, …) — scalar dot is unspecified.
+// On Apple Silicon for short rows (e.g. InstanceNorm 1D over T=65)
+// this silently produces wrong per-row mean and variance: rows that
+// should have mean≈0 / std≈1 end up with means scattered ±0.26 and
+// stds up to 2.7. Cascades through kokoro AdaIN1d into garbage
+// audio (cf. issue #94 series + the F0Ntrain bisect).
+//
+// Replace the two `dot` call sites with explicit per-T overloads so
+// the scalar instantiation no longer relies on undefined dot()
+// behavior. The float4 instantiation is unchanged in semantics
+// (x+y+z+w via dot(v, 1)). MUST RE-APPLY after every ggml bump.
+static inline float crispasr_vec_sum(float v)  { return v; }
+static inline float crispasr_vec_sum(float4 v) { return v.x + v.y + v.z + v.w; }
+static inline float crispasr_vec_sqsum(float v)  { return v * v; }
+static inline float crispasr_vec_sqsum(float4 v) { return v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w; }
+
 // F == 1 : norm (no fuse)
 // F == 2 : norm + mul
 // F == 3 : norm + mul + add
@@ -2921,7 +2973,7 @@ kernel void kernel_norm_fuse_impl(
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
         sumft += x[i00];
     }
-    sumf = dot(sumft, T(1.0f));
+    sumf = crispasr_vec_sum(sumft); // CrispASR patch — see header
     sumf = simd_sum(sumf);
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2932,8 +2984,24 @@ kernel void kernel_norm_fuse_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    // CrispASR patch — serial reduction by thread 0 of sg0 instead of
+    // the cross-simdgroup `sumf = shmem[tiisg]; simd_sum(sumf)` pattern.
+    // The original pattern produces wrong totals on Apple Silicon when
+    // the LAST simdgroup had ≤2 active threads during the prior parallel
+    // sum (bisected via tests/test_metal_norm_repro.cpp on T ∈ {33,
+    // 65, 66, 97, 129..132, 257}). shmem[31] is unused by the original
+    // code (init zeroed it, no sg writes to it), so reuse it as the
+    // broadcast slot.
+    if (sgitg == 0 && tiisg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = 0.0f;
+        for (uint sg = 0; sg < n_sg; sg++) {
+            total += shmem_f32[sg];
+        }
+        shmem_f32[31] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem_f32[31];
 
     const float mean = sumf/args.ne00;
 
@@ -2942,7 +3010,7 @@ kernel void kernel_norm_fuse_impl(
     sumf = 0.0f;
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
         y[i00] = x[i00] - mean;
-        sumf += dot(y[i00], y[i00]);
+        sumf += crispasr_vec_sqsum(y[i00]); // CrispASR patch — see header
     }
     sumf = simd_sum(sumf);
 
@@ -2954,8 +3022,17 @@ kernel void kernel_norm_fuse_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    // CrispASR patch — serial reduction (see kernel_norm mean step).
+    if (sgitg == 0 && tiisg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = 0.0f;
+        for (uint sg = 0; sg < n_sg; sg++) {
+            total += shmem_f32[sg];
+        }
+        shmem_f32[31] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem_f32[31];
 
     const float variance = sumf/args.ne00;
 
@@ -3016,7 +3093,7 @@ kernel void kernel_rms_norm_fuse_impl(
 
     // parallel sum
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
-        sumf += dot(x[i00], x[i00]);
+        sumf += crispasr_vec_sqsum(x[i00]); // CrispASR patch — see kernel_norm header
     }
     sumf = simd_sum(sumf);
 
@@ -3028,8 +3105,17 @@ kernel void kernel_rms_norm_fuse_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    // CrispASR patch — serial reduction by thread 0 (see kernel_norm header).
+    if (sgitg == 0 && tiisg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = 0.0f;
+        for (uint sg = 0; sg < n_sg; sg++) {
+            total += shmem_f32[sg];
+        }
+        shmem_f32[31] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem_f32[31];
 
     const float mean  = sumf/args.ne00;
     const float scale = 1.0f/sqrt(mean + args.eps);
@@ -3084,7 +3170,7 @@ kernel void kernel_l2_norm_impl(
 
     // parallel sum
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
-        sumf += dot(x[i00], x[i00]);
+        sumf += crispasr_vec_sqsum(x[i00]); // CrispASR patch — see kernel_norm header
     }
     sumf = simd_sum(sumf);
 
@@ -3096,8 +3182,17 @@ kernel void kernel_l2_norm_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    // CrispASR patch — serial reduction by thread 0 (see kernel_norm header).
+    if (sgitg == 0 && tiisg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = 0.0f;
+        for (uint sg = 0; sg < n_sg; sg++) {
+            total += shmem_f32[sg];
+        }
+        shmem_f32[31] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem_f32[31];
 
     const float scale = 1.0f/max(sqrt(sumf), args.eps);
 
@@ -4850,15 +4945,36 @@ kernel void kernel_conv_transpose_1d(
         uint3   tgpig[[threadgroup_position_in_grid]],
         uint3   tgpg[[threadgroups_per_grid]]) {
 
+    // CrispASR patch — restrict the input-position loop to the range
+    // [ceil((j - K + 1)/s0), floor(j/s0)] intersected with [0, IL-1],
+    // i.e. only the i values where i*s0 <= j < i*s0 + K. Upstream
+    // iterates the full IL range and filters with `if`, amplifying
+    // work by IL/ceil(K/s0) (~160x for IL=320, K=10, s0=5 in the
+    // qwen3-tts codec block 1) which trips the macOS GPU watchdog
+    // (kIOGPUCommandBufferCallbackErrorImpactingInteractivity) on M1
+    // for long codec graphs. MUST RE-APPLY after every ggml bump. See
+    // LEARNINGS.md "ggml fork patches we carry".
+    const int32_t j  = tgpig[0];
+    const int32_t s0 = args.s0;
+    const int32_t K  = args.K;
+    const int32_t IL = args.IL;
+
+    int32_t i_min;
+    {
+        int32_t a = j - K + 1;
+        i_min = a <= 0 ? 0 : (a + s0 - 1) / s0; // ceil(a/s0) for a>0
+    }
+    int32_t i_max = j / s0;
+    if (i_max > IL - 1) i_max = IL - 1;
+
     float v = 0.0f;
+    if (i_min <= i_max) {
+        for (int64_t c = 0; c < args.IC; c++) {
+            const int32_t kernel_offset = c * tgpg[1] * K + K * tgpig[1];
+            const int32_t input_offset  = c * IL;
 
-    for (int64_t c = 0; c < args.IC; c++) {
-        const int32_t kernel_offset = c * tgpg[1] * args.K + args.K * tgpig[1];
-        const int32_t input_offset = c * args.IL;
-
-        for (int64_t i = 0; i < args.IL; i++) {
-            if (tgpig[0] >= i * args.s0 && tgpig[0] < i * args.s0 + args.K) {
-                v += src0[kernel_offset + tgpig[0] - i * args.s0] * src1[input_offset + i];
+            for (int32_t i = i_min; i <= i_max; i++) {
+                v += float(src0[kernel_offset + j - i * s0]) * src1[input_offset + i];
             }
         }
     }
@@ -4885,6 +5001,471 @@ kernel void kernel_conv_transpose_1d<half>(
     device        char * dst,
     uint3   tgpig[[threadgroup_position_in_grid]],
     uint3    tgpg[[threadgroups_per_grid]]);
+
+
+// ── CrispASR patch (PR #160 col2im_1d decomposition) ──────────────────
+// Gather-based col2im_1d: scatter-add GEMM columns to 1D signal.
+// columns: [K*OC, T_in]  ->  output: [T_out, OC]
+// One thread per output element. F32 accumulator.
+// MUST RE-APPLY after every ggml bump.
+
+template <typename T>
+kernel void kernel_col2im_1d(
+        constant ggml_metal_kargs_col2im_1d & args,
+        device const T     * src0,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+
+    // dst (ggml_col2im_1d result) is ALWAYS F32 regardless of src0 type — the
+    // template parameter T types only the source column buffer (f16/f32). Writing
+    // T(sum) into the f32 destination corrupts the output for f16 input.
+    const int total = args.T_out * args.OC;
+    if ((int)gid >= total) return;
+
+    const int t_out = (int)gid % args.T_out;
+    const int oc    = (int)gid / args.T_out;
+    const int t_abs = t_out + args.p0;
+
+    int t_in_min = (t_abs - args.K + args.s0) / args.s0;
+    if (t_in_min < 0) t_in_min = 0;
+    int t_in_max = t_abs / args.s0;
+    if (t_in_max >= args.T_in) t_in_max = args.T_in - 1;
+
+    float sum = 0.0f;
+    for (int t_in = t_in_min; t_in <= t_in_max; t_in++) {
+        const int k = t_abs - t_in * args.s0;
+        sum += float(src0[(oc * args.K + k) + t_in * args.K_OC]);
+    }
+
+    dst[gid] = sum;
+}
+
+template [[host_name("kernel_col2im_1d_f32")]]
+kernel void kernel_col2im_1d<float>(
+    constant ggml_metal_kargs_col2im_1d & args,
+    device const float * src0,
+    device       float * dst,
+    uint gid [[thread_position_in_grid]]);
+
+template [[host_name("kernel_col2im_1d_f16")]]
+kernel void kernel_col2im_1d<half>(
+    constant ggml_metal_kargs_col2im_1d & args,
+    device const half  * src0,
+    device       float * dst,
+    uint gid [[thread_position_in_grid]]);
+
+// ── CrispASR patch (PR #07-metal-aa-snake-beta) ─────────────────────
+// Fused BigVGAN v2 anti-aliased SnakeBeta. One threadgroup per
+// (channel × seq-chunk × batch). Each thread owns AA_BUFFER_SIZE
+// output samples and keeps the upsample/intermediate/output arrays
+// in thread-private memory (no threadgroup memory, no global round-
+// trips between the upsample / snake / downsample stages).
+//
+// Ported from upstream IndexTTS CUDA reference
+// (anti_alias_activation_cuda.cu, Apache 2.0). Layout mirrors that
+// kernel exactly — kept literal so the next NVIDIA bump is mergable.
+// MUST RE-APPLY after every ggml bump.
+constant constexpr int AA_FILTER_SIZE      = 12;
+constant constexpr int AA_HALF_FILTER_SIZE = 6;
+constant constexpr int AA_BUFFER_SIZE      = 32;
+constant constexpr int AA_UP_REP_PAD       = 5;
+constant constexpr int AA_DS_REP_PAD_LEFT  = 5;
+constant constexpr int AA_DS_REP_PAD_RIGHT = 6;
+constant constexpr int AA_THREADS_PER_TGRP = 128;
+
+template <typename T>
+kernel void kernel_aa_snake_beta_impl(
+        constant ggml_metal_kargs_aa_snake_beta & args      [[buffer(0)]],
+        device const T                          * src       [[buffer(1)]],
+        device const T                          * log_alpha [[buffer(2)]],
+        device const T                          * log_beta  [[buffer(3)]],
+        device const T                          * up_ftr    [[buffer(4)]],
+        device const T                          * down_ftr  [[buffer(5)]],
+        device T                                * dst       [[buffer(6)]],
+        uint3                                     tgpig     [[threadgroup_position_in_grid]],
+        uint3                                     tpitg     [[thread_position_in_threadgroup]]) {
+
+    const int seq_blk = (int) tgpig.x;   // chunk index
+    const int chan    = (int) tgpig.y;   // channel
+    const int tid     = (int) tpitg.x;
+    const int seq_len = args.T;
+
+    // Each thread covers [seq_offset, seq_offset + AA_BUFFER_SIZE).
+    const int seq_offset = seq_blk * AA_THREADS_PER_TGRP * AA_BUFFER_SIZE
+                         + tid * AA_BUFFER_SIZE;
+    const int intermediate_seq_offset = seq_offset * 2;
+
+    // Pointer to this thread's start in the per-channel slice
+    // (layout matches ggml's [T, C] — T-fastest, channel-major).
+    const int channel_offset = chan * seq_len;
+    device const T * src_ch  = src + channel_offset;
+    device       T * dst_ch  = dst + channel_offset;
+
+    // Replicate-pad reference values (always defined; safe even when
+    // seq_offset >= seq_len because we bounds-check writes below).
+    const float seq_left  = (float) src_ch[0];
+    const float seq_right = (float) src_ch[seq_len - 1];
+
+    // Per-channel snake-beta gains.
+    const float alpha_val = exp((float) log_alpha[chan]);
+    const float beta_val  = exp((float) log_beta[chan]);
+
+    // Filter taps copied into thread-private storage. Upstream applies
+    // the ×2 zero-stuff gain on the element loads, not the filter, so
+    // we mirror that to keep the GGUF filter untouched.
+    float up_filter[AA_FILTER_SIZE];
+    float down_filter[AA_FILTER_SIZE];
+    #pragma unroll
+    for (int k = 0; k < AA_FILTER_SIZE; k++) {
+        up_filter[k]   = (float) up_ftr[k];
+        down_filter[k] = (float) down_ftr[k];
+    }
+
+    // Thread-private workspaces. Size matches upstream exactly so the
+    // semantics stay literal — see the upstream comment about the
+    // DOWNSAMPLE_REPLICATION_PAD_LEFT headroom in `intermediates`.
+    float elements[2 * AA_FILTER_SIZE + 2 * AA_BUFFER_SIZE + 2 * AA_UP_REP_PAD] = {0};
+    float intermediates[2 * AA_FILTER_SIZE + 2 * AA_BUFFER_SIZE
+                        + AA_DS_REP_PAD_LEFT + AA_DS_REP_PAD_RIGHT]              = {0};
+    float output[AA_BUFFER_SIZE] = {0};
+
+    // ── 1. Load elements with replicate-pad and zero-stuff. ─────────
+    // Writes go to even indices `2*(HALF + it)`; odd indices stay 0.
+    // The ×2 factor on the loaded value is the zero-stuff gain.
+    #pragma unroll
+    for (int it = -AA_HALF_FILTER_SIZE; it < AA_BUFFER_SIZE + AA_HALF_FILTER_SIZE; it++) {
+        const int element_index = seq_offset + it;
+        const int slot = 2 * (AA_HALF_FILTER_SIZE + it);
+        if ((element_index < 0) && (element_index >= -AA_UP_REP_PAD)) {
+            elements[slot] = 2.0f * seq_left;
+        } else if ((element_index >= seq_len) && (element_index < seq_len + AA_UP_REP_PAD)) {
+            elements[slot] = 2.0f * seq_right;
+        } else if ((element_index >= 0) && (element_index < seq_len)) {
+            elements[slot] = 2.0f * (float) src_ch[element_index];
+        }
+    }
+
+    // ── 2. Upsample FIR. Writes go into `intermediates` with the left
+    // downsample-pad headroom reserved.
+    #pragma unroll
+    for (int it = 0; it < (2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE); it++) {
+        float acc = 0.0f;
+        const int element_index = intermediate_seq_offset + it;
+        #pragma unroll
+        for (int f = 0; f < AA_FILTER_SIZE; f++) {
+            if ((element_index + f) >= 0) {
+                acc += up_filter[f] * elements[it + f];
+            }
+        }
+        intermediates[it + AA_DS_REP_PAD_LEFT] = acc;
+    }
+
+    // ── 3. SnakeBeta in place on the active range.
+    const float inv_beta = 1.0f / (beta_val + 1e-9f);
+    #pragma unroll
+    for (int it = 0; it < 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE; it++) {
+        const float v = intermediates[it + AA_DS_REP_PAD_LEFT];
+        const float s = sin(alpha_val * v);
+        intermediates[it + AA_DS_REP_PAD_LEFT] = v + inv_beta * s * s;
+    }
+
+    // ── 4. Replicate-pad left/right for the downsample FIR.
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_LEFT; it++) {
+        intermediates[it] = intermediates[AA_DS_REP_PAD_LEFT];
+    }
+    const int tail_first = AA_DS_REP_PAD_LEFT + 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE;
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_RIGHT; it++) {
+        intermediates[tail_first + it] = intermediates[tail_first - 1];
+    }
+
+    // ── 5. Downsample FIR (stride 2). The `+ AA_DS_REP_PAD_RIGHT`
+    // offset matches the upstream torch slice — DO NOT collapse.
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int f = 0; f < AA_FILTER_SIZE; f++) {
+            acc += down_filter[f] * intermediates[it * 2 + f + AA_DS_REP_PAD_RIGHT];
+        }
+        output[it] = acc;
+    }
+
+    // ── 6. Write back (bounds-checked at the tail thread).
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        const int element_index = seq_offset + it;
+        if (element_index < seq_len) {
+            dst_ch[element_index] = (T) output[it];
+        }
+    }
+}
+
+typedef decltype(kernel_aa_snake_beta_impl<float>) aa_snake_beta_t;
+template [[host_name("kernel_aa_snake_beta_f32")]]
+kernel aa_snake_beta_t kernel_aa_snake_beta_impl<float>;
+
+
+// ── CrispASR patch (PR #07-metal-aa-snake-beta) — opt-in variants ───
+// Two alternative kernels kept reachable via INDEXTTS_AA_METAL_VARIANT
+// so they can be re-benched on different Apple GPU families. Both
+// produce numerically-identical output to the default v1 kernel above
+// (verified: WAV rmsdiff == 0). On M1 both were measured slower than
+// the default during the Phase 3 sweep (see commit notes); on M3+ or
+// future architectures the tradeoff may flip.
+//
+// MUST RE-APPLY after every ggml bump.
+
+// Variant: polyphase upsample with a pre-loaded per-thread input
+// window. Halves the upsample mul count (6-tap × 2 phases vs 12-tap
+// zero-stuff FIR) and eliminates the ~392 B/thread `elements[]`
+// array. On M1 the irregular base-index pattern in the polyphase
+// loop empirically regressed th_max from 832 to 768 and wall-clock
+// by ~25 %.
+template <typename T>
+kernel void kernel_aa_snake_beta_polyphase_impl(
+        constant ggml_metal_kargs_aa_snake_beta & args      [[buffer(0)]],
+        device const T                          * src       [[buffer(1)]],
+        device const T                          * log_alpha [[buffer(2)]],
+        device const T                          * log_beta  [[buffer(3)]],
+        device const T                          * up_ftr    [[buffer(4)]],
+        device const T                          * down_ftr  [[buffer(5)]],
+        device T                                * dst       [[buffer(6)]],
+        uint3                                     tgpig     [[threadgroup_position_in_grid]],
+        uint3                                     tpitg     [[thread_position_in_threadgroup]]) {
+
+    const int seq_blk = (int) tgpig.x;
+    const int chan    = (int) tgpig.y;
+    const int tid     = (int) tpitg.x;
+    const int seq_len = args.T;
+
+    const int seq_offset = seq_blk * AA_THREADS_PER_TGRP * AA_BUFFER_SIZE
+                         + tid * AA_BUFFER_SIZE;
+
+    const int channel_offset = chan * seq_len;
+    device const T * src_ch  = src + channel_offset;
+    device       T * dst_ch  = dst + channel_offset;
+
+    const float seq_left  = (float) src_ch[0];
+    const float seq_right = (float) src_ch[seq_len - 1];
+
+    const float alpha_val = exp((float) log_alpha[chan]);
+    const float beta_val  = exp((float) log_beta[chan]);
+    const float inv_beta  = 1.0f / (beta_val + 1e-9f);
+
+    // Bake the ×2 zero-stuff gain into the upsample filter.
+    float up_filter[AA_FILTER_SIZE];
+    float down_filter[AA_FILTER_SIZE];
+    #pragma unroll
+    for (int k = 0; k < AA_FILTER_SIZE; k++) {
+        up_filter[k]   = 2.0f * (float) up_ftr[k];
+        down_filter[k] = (float) down_ftr[k];
+    }
+
+    // input_window[j] = input(seq_offset − HALF + j) with replicate-pad.
+    constexpr int AA_INPUT_WIN = AA_BUFFER_SIZE + 2 * AA_HALF_FILTER_SIZE;
+    float input_window[AA_INPUT_WIN] = {0};
+    #pragma unroll
+    for (int j = 0; j < AA_INPUT_WIN; j++) {
+        const int idx = seq_offset - AA_HALF_FILTER_SIZE + j;
+        if (idx >= 0 && idx < seq_len) {
+            input_window[j] = (float) src_ch[idx];
+        } else if (idx < 0 && idx >= -AA_UP_REP_PAD) {
+            input_window[j] = seq_left;
+        } else if (idx >= seq_len && idx < seq_len + AA_UP_REP_PAD) {
+            input_window[j] = seq_right;
+        }
+    }
+
+    float intermediates[2 * AA_FILTER_SIZE + 2 * AA_BUFFER_SIZE
+                        + AA_DS_REP_PAD_LEFT + AA_DS_REP_PAD_RIGHT] = {0};
+
+    #pragma unroll
+    for (int it = 0; it < (2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE); it++) {
+        const int p = it & 1;
+        const int base = (it + p) / 2;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int kk = 0; kk < AA_FILTER_SIZE / 2; kk++) {
+            acc += up_filter[p + 2 * kk] * input_window[base + kk];
+        }
+        intermediates[it + AA_DS_REP_PAD_LEFT] = acc;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE; it++) {
+        const float v = intermediates[it + AA_DS_REP_PAD_LEFT];
+        const float s = sin(alpha_val * v);
+        intermediates[it + AA_DS_REP_PAD_LEFT] = v + inv_beta * s * s;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_LEFT; it++) {
+        intermediates[it] = intermediates[AA_DS_REP_PAD_LEFT];
+    }
+    const int tail_first_p = AA_DS_REP_PAD_LEFT + 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE;
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_RIGHT; it++) {
+        intermediates[tail_first_p + it] = intermediates[tail_first_p - 1];
+    }
+
+    float output_p[AA_BUFFER_SIZE];
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int f = 0; f < AA_FILTER_SIZE; f++) {
+            acc += down_filter[f] * intermediates[it * 2 + f + AA_DS_REP_PAD_RIGHT];
+        }
+        output_p[it] = acc;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        const int abs_idx = seq_offset + it;
+        if (abs_idx < seq_len) {
+            dst_ch[abs_idx] = (T) output_p[it];
+        }
+    }
+}
+
+template [[host_name("kernel_aa_snake_beta_polyphase_f32")]]
+kernel aa_snake_beta_t kernel_aa_snake_beta_polyphase_impl<float>;
+
+
+// Variant: threadgroup-shared input tile (cooperative load). Reduces
+// device-memory bandwidth to one chunk-wide read per threadgroup, at
+// the cost of a ~16 KB threadgroup allocation. On M1 the shared
+// allocation regressed th_max from 832 to 640 (the SM's register
+// budget competes with shared mem on Apple's tiled architecture) and
+// wall-clock by ~30 %.
+constant constexpr int AA_TILE_PAD_LEFT  = AA_HALF_FILTER_SIZE;
+constant constexpr int AA_TILE_PAD_RIGHT = AA_HALF_FILTER_SIZE + AA_FILTER_SIZE / 2;
+constant constexpr int AA_TILE_TOTAL     = AA_THREADS_PER_TGRP * AA_BUFFER_SIZE
+                                           + AA_TILE_PAD_LEFT + AA_TILE_PAD_RIGHT + 16;
+constant constexpr int AA_TILE_LOAD_ITERS = (AA_TILE_TOTAL + AA_THREADS_PER_TGRP - 1)
+                                           / AA_THREADS_PER_TGRP;
+
+template <typename T>
+kernel void kernel_aa_snake_beta_tgmem_impl(
+        constant ggml_metal_kargs_aa_snake_beta & args      [[buffer(0)]],
+        device const T                          * src       [[buffer(1)]],
+        device const T                          * log_alpha [[buffer(2)]],
+        device const T                          * log_beta  [[buffer(3)]],
+        device const T                          * up_ftr    [[buffer(4)]],
+        device const T                          * down_ftr  [[buffer(5)]],
+        device T                                * dst       [[buffer(6)]],
+        uint3                                     tgpig     [[threadgroup_position_in_grid]],
+        uint3                                     tpitg     [[thread_position_in_threadgroup]]) {
+
+    const int seq_blk = (int) tgpig.x;
+    const int chan    = (int) tgpig.y;
+    const int tid     = (int) tpitg.x;
+    const int seq_len = args.T;
+
+    const int chunk_start = seq_blk * AA_THREADS_PER_TGRP * AA_BUFFER_SIZE;
+    const int local_start = tid * AA_BUFFER_SIZE;
+    const int seq_offset  = chunk_start + local_start;
+
+    const int channel_offset = chan * seq_len;
+    device const T * src_ch  = src + channel_offset;
+    device       T * dst_ch  = dst + channel_offset;
+
+    threadgroup float input_tile[AA_TILE_TOTAL];
+
+    {
+        const float seq_left  = (float) src_ch[0];
+        const float seq_right = (float) src_ch[seq_len - 1];
+        #pragma unroll
+        for (int it = 0; it < AA_TILE_LOAD_ITERS; it++) {
+            const int local_idx = it * AA_THREADS_PER_TGRP + tid;
+            if (local_idx < AA_TILE_TOTAL) {
+                const int abs_idx = chunk_start + local_idx - AA_TILE_PAD_LEFT;
+                float val;
+                if (abs_idx >= 0 && abs_idx < seq_len) {
+                    val = (float) src_ch[abs_idx];
+                } else if (abs_idx < 0 && abs_idx >= -AA_UP_REP_PAD) {
+                    val = seq_left;
+                } else if (abs_idx >= seq_len && abs_idx < seq_len + AA_UP_REP_PAD) {
+                    val = seq_right;
+                } else {
+                    val = 0.0f;
+                }
+                input_tile[local_idx] = val;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float alpha_val = exp((float) log_alpha[chan]);
+    const float beta_val  = exp((float) log_beta[chan]);
+    const float inv_beta  = 1.0f / (beta_val + 1e-9f);
+
+    float up_filter[AA_FILTER_SIZE];
+    float down_filter[AA_FILTER_SIZE];
+    #pragma unroll
+    for (int k = 0; k < AA_FILTER_SIZE; k++) {
+        up_filter[k]   = 2.0f * (float) up_ftr[k];
+        down_filter[k] = (float) down_ftr[k];
+    }
+
+    float intermediates[2 * AA_FILTER_SIZE + 2 * AA_BUFFER_SIZE
+                        + AA_DS_REP_PAD_LEFT + AA_DS_REP_PAD_RIGHT] = {0};
+
+    // AA_TILE_PAD_LEFT == AA_HALF_FILTER_SIZE so the (-HALF, +TILE_PAD)
+    // offsets cancel and tile_base reduces to local_start.
+    #pragma unroll
+    for (int it = 0; it < (2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE); it++) {
+        const int p = it & 1;
+        const int base = local_start + (it + p) / 2;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int kk = 0; kk < AA_FILTER_SIZE / 2; kk++) {
+            acc += up_filter[p + 2 * kk] * input_tile[base + kk];
+        }
+        intermediates[it + AA_DS_REP_PAD_LEFT] = acc;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE; it++) {
+        const float v = intermediates[it + AA_DS_REP_PAD_LEFT];
+        const float s = sin(alpha_val * v);
+        intermediates[it + AA_DS_REP_PAD_LEFT] = v + inv_beta * s * s;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_LEFT; it++) {
+        intermediates[it] = intermediates[AA_DS_REP_PAD_LEFT];
+    }
+    const int tail_first_t = AA_DS_REP_PAD_LEFT + 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE;
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_RIGHT; it++) {
+        intermediates[tail_first_t + it] = intermediates[tail_first_t - 1];
+    }
+
+    float output_t[AA_BUFFER_SIZE];
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int f = 0; f < AA_FILTER_SIZE; f++) {
+            acc += down_filter[f] * intermediates[it * 2 + f + AA_DS_REP_PAD_RIGHT];
+        }
+        output_t[it] = acc;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        const int abs_idx = seq_offset + it;
+        if (abs_idx < seq_len) {
+            dst_ch[abs_idx] = (T) output_t[it];
+        }
+    }
+}
+
+template [[host_name("kernel_aa_snake_beta_tgmem_f32")]]
+kernel aa_snake_beta_t kernel_aa_snake_beta_tgmem_impl<float>;
 
 
 typedef void (conv_transpose_2d_t)(
@@ -7833,6 +8414,336 @@ kernel void kernel_mul_mv_q4_K_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+// CrispASR patch (#83): Q8_K input quantize kernel.
+//
+// Mirrors quantize_row_q8_K_ref in ggml-quants.c exactly. Each threadgroup
+// processes 1 Q8_K block (256 F32 elements) of one input column. 32 threads
+// per group, each handles 8 elements. simd_shuffle_xor reduces to find amax
+// (and the corresponding signed max). Bsums computed via pair-wise simd
+// shuffle (each pair of threads covers one 16-element bsum group).
+//
+// Used as a pre-step for kernel_mul_mv_q4_K_q8_K so GPU mat-vec mul matches
+// CPU's reference (which uses Q8_K-quantised input) bit-for-bit.
+//
+// dispatch grid: (num_blocks_per_row, ne01_input_rows, ne02 * ne03_batches).
+// dispatch threads: 32 per group.
+//
+// dst layout: stride = num_blocks_per_row * sizeof(block_q8_K) per
+// (col, batch) tuple, contiguous along block_idx.
+[[host_name("kernel_quantize_q8_K_f32")]]
+kernel void kernel_quantize_q8_K_f32(
+        constant ggml_metal_kargs_quantize_q8_K & args,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiisg [[thread_index_in_simdgroup]]) {
+    constexpr int QK = 256;
+    constexpr int TPG = 32;
+    constexpr int EPT = QK / TPG;  // 8 elements per thread
+
+    const uint block_idx = tgpig.x;
+    const uint col       = tgpig.y;
+    const uint batch     = tgpig.z;
+
+    // Source pointer: F32 input at column `col`, batch, block `block_idx`.
+    const uint64_t src_off = batch * args.nb03 + col * args.nb01 + (uint64_t)block_idx * QK * sizeof(float);
+    device const float * x = (device const float *)(src + src_off);
+
+    // Each thread reads 8 contiguous elements
+    float my_x[EPT];
+    float my_amax = 0.0f;
+    float my_max  = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < EPT; ++i) {
+        my_x[i] = x[tiisg * EPT + i];
+        float a = fabs(my_x[i]);
+        if (a > my_amax) {
+            my_amax = a;
+            my_max  = my_x[i];
+        }
+    }
+
+    // simd-reduce: find global amax + corresponding signed max.
+    // Tree reduction via shuffle_xor.
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float oa = simd_shuffle_xor(my_amax, offset);
+        float om = simd_shuffle_xor(my_max,  offset);
+        if (oa > my_amax) {
+            my_amax = oa;
+            my_max  = om;
+        }
+    }
+    const float amax = simd_broadcast(my_amax, 0);
+    const float max_v = simd_broadcast(my_max,  0);
+
+    // Mirror CPU's quantize_row_q8_K_ref: iscale = -127.f / max (note sign).
+    const float iscale = (amax > 0.0f) ? (-127.0f / max_v) : 0.0f;
+    const float d      = (amax > 0.0f) ? (1.0f / iscale)   : 0.0f;
+
+    // Output block pointer.
+    const uint64_t out_blocks_per_col = (uint64_t)args.num_blocks_per_row;
+    const uint64_t out_off =
+        (((uint64_t)batch * args.ne01 + col) * out_blocks_per_col + block_idx) * sizeof(block_q8_K);
+    device block_q8_K * out = (device block_q8_K *)(dst + out_off);
+
+    if (tiisg == 0) {
+        out->d = d;
+    }
+
+    // Quantize 8 elements per thread, accumulate partial sum.
+    int total_sum = 0;
+    #pragma unroll
+    for (int i = 0; i < EPT; ++i) {
+        int v = int(round(iscale * my_x[i]));
+        v = min(v, 127);
+        out->qs[tiisg * EPT + i] = (int8_t)v;
+        total_sum += v;
+    }
+
+    // bsums: 16 sums per block, each covers 16 elements. With 8 elements
+    // per thread, two adjacent threads cover one bsum group.
+    int partner_sum = simd_shuffle_xor(total_sum, 1);
+    if ((tiisg & 1) == 0) {
+        out->bsums[tiisg / 2] = (int16_t)(total_sum + partner_sum);
+    }
+}
+
+// CrispASR patch (#83): Q4_K × Q8_K mat-vec multiply, F32 output.
+//
+// Mirrors ggml_vec_dot_q4_K_q8_K_generic (ggml-cpu/quants.c:645) exactly so
+// that GPU output matches CPU bit-for-bit when both use Q4_K weights and the
+// F32 input has been pre-quantised to Q8_K via kernel_quantize_q8_K_f32.
+//
+// Each thread computes one output element [row, col, batch]. Pure scalar
+// integer arithmetic; no simdgroup matmul. Slow vs the legacy F32-input
+// kernel but correct.
+//
+// dispatch grid: (ceil(ne01/TG), ne11, ne02*ne03).
+// dispatch threads: 32 per group. row = tgpig.x*32 + tiitg.
+[[host_name("kernel_mul_mv_q4_K_q8_K")]]
+kernel void kernel_mul_mv_q4_K_q8_K(
+        constant ggml_metal_kargs_mul_mv_q4_K_q8_K & args,
+        device const char * src0,    // Q4_K weights
+        device const char * src1,    // Q8_K input (pre-quantised)
+        device       char * dst,     // F32 output
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiitg [[thread_index_in_threadgroup]]) {
+    constexpr int QK = 256;
+    constexpr int TPG = 32;
+
+    const uint row   = tgpig.x * TPG + tiitg;
+    const uint col   = tgpig.y;
+    const uint batch = tgpig.z;
+
+    if ((int)row >= args.ne01) {
+        return;
+    }
+
+    const int nb = args.ne00 / QK;
+
+    constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    constexpr uint32_t kmask3 = 0x03030303;
+
+    const uint i12 = batch % args.ne12;
+    const uint i13 = batch / args.ne12;
+
+    device const block_q4_K * x = (device const block_q4_K *)
+        (src0 + (uint64_t)row * args.nb01
+              + (uint64_t)(i12 / args.r2) * args.nb02
+              + (uint64_t)(i13 / args.r3) * args.nb03);
+
+    device const block_q8_K * y = (device const block_q8_K *)
+        (src1 + ((uint64_t)batch * args.ne11 + col) * (uint64_t)nb * sizeof(block_q8_K));
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        // Unpack the 12-byte Q4_K scales table into 8 scale + 8 min uchars.
+        uint32_t utmp[4];
+        device const uint32_t * scales32 = (device const uint32_t *)x[i].scales;
+        utmp[0] = scales32[0];
+        utmp[1] = scales32[1];
+        utmp[2] = scales32[2];
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        thread const uint8_t * scales = (thread const uint8_t *)&utmp[0];
+        thread const uint8_t * mins   = (thread const uint8_t *)&utmp[2];
+
+        // Unpack 256 Q4_K nibbles into thread-private int8 buffer.
+        int8_t a[QK];
+        device const uchar * q4 = x[i].qs;
+        thread int8_t * ap = &a[0];
+        for (int j = 0; j < QK / 64; ++j) {
+            for (int l = 0; l < 32; ++l) ap[l]      = (int8_t)(q4[l] & 0x0F);
+            for (int l = 0; l < 32; ++l) ap[l + 32] = (int8_t)(q4[l] >> 4);
+            ap += 64; q4 += 32;
+        }
+
+        // dmin contribution: -dmin_q4 * y_d * sum_y where sum_y uses bsums × mins.
+        int sumi = 0;
+        for (int j = 0; j < QK / 16; ++j) {
+            sumi += (int)y[i].bsums[j] * (int)mins[j / 2];
+        }
+
+        // 8 int32 accumulators, one per "lane" position within an 8-element chunk.
+        int aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        device const int8_t * q8 = y[i].qs;
+        ap = &a[0];
+        int is = 0;
+        for (int j = 0; j < QK / 32; ++j) {  // 8 sub-blocks of 32 elements each
+            int32_t scale = scales[is++];
+            #pragma unroll
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    aux32[l] += scale * (int)q8[l] * (int)ap[l];
+                }
+                q8 += 8; ap += 8;
+            }
+        }
+
+        const float d_combined = (float)x[i].d * y[i].d;
+        for (int l = 0; l < 8; ++l) {
+            sumf += d_combined * (float)aux32[l];
+        }
+        const float dmin_combined = (float)x[i].dmin * y[i].d;
+        sumf -= dmin_combined * (float)sumi;
+    }
+
+    // Output position: dst is F32, layout (ne0, ne1, batch).
+    device float * dst_f32 = (device float *)dst;
+    dst_f32[(uint64_t)batch * args.ne0 * args.ne1 + (uint64_t)col * args.ne0 + row] = sumf;
+}
+
+// CrispASR patch (#83 r9): F32 → Q8_0 input quantize, mirrors CPU's
+// quantize_row_q8_0_ref bit-for-bit (32-elem block, F16 scale, round-to-nearest
+// int8 quants). Pre-step for kernel_mul_mv_q8_0_q8_0 below.
+//
+// One block (32 elements) per simdgroup; one element per thread (QK8_0 == SIMD).
+// dispatch grid: (num_blocks_per_row, ne01_input_rows, ne02 * ne03_batches).
+// dispatch threads: 32 per group.
+//
+// dst layout: stride = num_blocks_per_row * sizeof(block_q8_0) per
+// (col, batch) tuple, contiguous along block_idx.
+[[host_name("kernel_quantize_q8_0_f32")]]
+kernel void kernel_quantize_q8_0_f32(
+        constant ggml_metal_kargs_quantize_q8_0 & args,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiisg [[thread_index_in_simdgroup]]) {
+    constexpr int QK = 32;
+
+    const uint block_idx = tgpig.x;
+    const uint col       = tgpig.y;
+    const uint batch     = tgpig.z;
+
+    // Source pointer: F32 input at column `col`, batch, block `block_idx`.
+    const uint64_t src_off = batch * args.nb03 + col * args.nb01 + (uint64_t)block_idx * QK * sizeof(float);
+    device const float * x = (device const float *)(src + src_off);
+
+    // One element per thread (QK == 32 == SIMD width).
+    const float my_x  = x[tiisg];
+    float       my_a  = fabs(my_x);
+
+    // simd-reduce: amax via tree shuffle_xor.
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float oa = simd_shuffle_xor(my_a, offset);
+        if (oa > my_a) my_a = oa;
+    }
+    const float amax = simd_broadcast(my_a, 0);
+
+    // Mirror CPU quantize_row_q8_0 (ARM NEON path on M1):
+    //   d  = amax / 127     (F32; stored as F16 for the block scale)
+    //   id = 1 / d          (F32; uses ORIGINAL F32 d, not the F16 round-trip!)
+    //   qs[j] = vcvtnq_s32_f32(x[j] * id)  → round-to-nearest, ties to even
+    // ARM NEON's vcvtnq_s32_f32 (and x86's roundps with ROUND_NEAREST) both
+    // use banker's rounding. The CPU vec_dot_q8_0_q8_0_generic dot is what
+    // computes the result; what matters is that we match the ARCH-SPECIFIC
+    // quantize that runs on the M1 CPU path — not the _ref roundf variant.
+    const float d  = amax / 127.0f;
+    const float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+
+    // Output block pointer.
+    const uint64_t out_blocks_per_col = (uint64_t)args.num_blocks_per_row;
+    const uint64_t out_off =
+        (((uint64_t)batch * args.ne01 + col) * out_blocks_per_col + block_idx) * sizeof(block_q8_0);
+    device block_q8_0 * out = (device block_q8_0 *)(dst + out_off);
+
+    if (tiisg == 0) {
+        out->d = (half)d;
+    }
+
+    // rint() rounds to nearest integer using current rounding mode; under
+    // default IEEE round-to-nearest-even, this matches vcvtnq_s32_f32.
+    const float scaled = my_x * id;
+    out->qs[tiisg] = (int8_t)rint(scaled);
+}
+
+// CrispASR patch (#83 r9): Q8_0 × Q8_0 mat-vec multiply, F32 output.
+//
+// Mirrors ggml_vec_dot_q8_0_q8_0_generic (ggml-cpu/quants.c:400) exactly:
+// per 32-elem block, int8 × int8 → int32 accumulator, then multiply by
+// (x.d_f32 * y.d_f32) and accumulate into F32 sumf. Pure scalar integer
+// arithmetic per output element; no simdgroup matmul. Slow vs the legacy
+// F32-input kernel but bit-identical to CPU.
+//
+// dispatch grid: (ceil(ne01/TG), ne11, ne02*ne03).
+// dispatch threads: 32 per group. row = tgpig.x*32 + tiitg.
+[[host_name("kernel_mul_mv_q8_0_q8_0")]]
+kernel void kernel_mul_mv_q8_0_q8_0(
+        constant ggml_metal_kargs_mul_mv_q8_0_q8_0 & args,
+        device const char * src0,    // Q8_0 weights
+        device const char * src1,    // Q8_0 input (pre-quantised)
+        device       char * dst,     // F32 output
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiitg [[thread_index_in_threadgroup]]) {
+    constexpr int QK = 32;
+    constexpr int TPG = 32;
+
+    const uint row   = tgpig.x * TPG + tiitg;
+    const uint col   = tgpig.y;
+    const uint batch = tgpig.z;
+
+    if ((int)row >= args.ne01) {
+        return;
+    }
+
+    const int nb = args.ne00 / QK;
+
+    const uint i12 = batch % args.ne12;
+    const uint i13 = batch / args.ne12;
+
+    device const block_q8_0 * x = (device const block_q8_0 *)
+        (src0 + (uint64_t)row * args.nb01
+              + (uint64_t)(i12 / args.r2) * args.nb02
+              + (uint64_t)(i13 / args.r3) * args.nb03);
+
+    device const block_q8_0 * y = (device const block_q8_0 *)
+        (src1 + ((uint64_t)batch * args.ne11 + col) * (uint64_t)nb * sizeof(block_q8_0));
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        int sumi = 0;
+        device const int8_t * xq = x[i].qs;
+        device const int8_t * yq = y[i].qs;
+        for (int j = 0; j < QK; ++j) {
+            sumi += (int)xq[j] * (int)yq[j];
+        }
+        sumf += (float)sumi * ((float)x[i].d * (float)y[i].d);
+    }
+
+    // Output position: dst is F32, layout (ne0, ne1, batch).
+    device float * dst_f32 = (device float *)dst;
+    dst_f32[(uint64_t)batch * args.ne0 * args.ne1 + (uint64_t)col * args.ne0 + row] = sumf;
+}
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_q5_K_f32_impl(
         args_t args,
@@ -9649,6 +10560,208 @@ kernel void kernel_mul_mm(
 
 #endif // GGML_METAL_HAS_TENSOR
 
+// CrispASR patch (#83): high-precision mul_mm variant — keeps F32 inputs in
+// shared memory (no F16 round-to-half cast on B), so the simdgroup matmul
+// runs F32 × F32 → F32 instead of half × half → F32. Selected via the
+// existing GGML_PREC_F32 op_param flag in mul_mm dispatch when the result
+// would otherwise drift past chatterbox's multinomial-sampler tolerance
+// (LEARNINGS §"Root cause located — ggml-metal kernel_mul_mm legacy path").
+//
+// Layout differences vs the legacy kernel above:
+//   - sa: 64*32*sizeof(float) = 8192 bytes  (vs 4096 with half)
+//   - sb: 32*32*sizeof(float) = 4096 bytes  (vs 2048 with half)
+//   - total shmem: 12288 bytes  (vs 6144 with half)
+//   - operand simdgroup tiles are simdgroup_float8x8 (S0_8x8 = S1_8x8 = float)
+template<
+    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &),
+    typename T0, typename T0_4x4>
+kernel void kernel_mul_mm_hp(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    // F32 layout: sa is 8192 bytes (64*32*sizeof(float)).
+    threadgroup float * sa = (threadgroup float *)(shmem);
+    threadgroup float * sb = (threadgroup float *)(shmem + 8192);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    short il = il0;
+
+    const int i12 = im%args.ne12;
+    const int i13 = im/args.ne12;
+
+    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    const short    offset1 = il0/nl;
+
+    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const float * y = (device const float *)(src1
+        + args.nb13*i13
+        + args.nb12*i12
+        + args.nb11*(r1 + lr1)
+        + args.nb10*iy);
+
+    simdgroup_float8x8 ma[4];
+    simdgroup_float8x8 mb[2];
+
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++){
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // load A: dequantise weight block into a F32 tile in shmem
+        if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+
+                *(sa + 64*ib + 8*ly + lx) = loop_k + 16*il + i < args.ne00 ? (float) *((device T0 *) x + i) : 0.0f;
+            }
+        } else {
+            float4x4 temp_a;
+            dequantize_func(x, il, temp_a);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            FOR_UNROLL (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        // load B: copy F32 input into F32 shmem (no F16 round)
+        if (FC_mul_mm_bc_inp) {
+            for (short i = 0; i < 8; ++i) {
+                const short sx = (tiitg%NL1);
+                const short sy = (tiitg/NL1)/8;
+                const short lx = i;
+                const short ly = (tiitg/NL1)%8;
+                const short ib = 4*sx + sy;
+
+                *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? *((device float *) y + i) : 0.0f;
+            }
+        } else {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            const short ly = (tiitg/NL1)%8;
+            const short ib = 4*sx + sy;
+
+            *(threadgroup float2x4 *)(sb + 64*ib + 8*ly) = *((device float2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const float * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const float * lsmb = (sb + 2*64*(sgitg/2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            // F32 × F32 → F32 simdgroup MAC (the whole point of this kernel).
+            FOR_UNROLL (short i = 0; i < 8; i++){
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+        device float * C = (device float *) dst +
+            (r0 + 32*(sgitg &  1)) +
+            (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device float4 * D4 = (device float4 *) D;
+
+                threadgroup float  * C  = temp_str + (j*NR0);
+                threadgroup float4 * C4 = (threadgroup float4 *) C;
+
+                int i = 0;
+                for (; i < nr0/4; i++) {
+                    *(D4 + i) = *(C4 + i);
+                }
+
+                i *= 4;
+                for (; i < nr0; i++) {
+                    *(D + i) = *(C + i);
+                }
+            }
+        }
+    }
+}
+
 template<short ne20> // n_expert_used
 kernel void kernel_mul_mm_id_map0(
         constant ggml_metal_kargs_mul_mm_id_map0 & args,
@@ -10145,6 +11258,22 @@ template [[host_name("kernel_mul_mm_iq1_s_f16")]]   kernel mul_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_iq1_m_f16")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_m,   QK_NL, dequantize_iq1_m,   float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_iq4_nl_f16")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_iq4_xs_f16")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
+
+// CrispASR patch (#83): high-precision (F32-tile) mul_mm instantiations.
+// Selected at dispatch time when the op carries the GGML_PREC_F32 hint.
+// Names are kernel_mul_mm_<weight>_f32_hp; pipeline lookup in
+// ggml_metal_library_get_pipeline_mul_mm appends "_hp" to the base name
+// when prec == GGML_PREC_F32. Only the chatterbox-relevant weight quant
+// set is wired up below — other PREC_F32 callers fall through to the
+// half-tile kernel with a one-shot warning.
+typedef decltype(kernel_mul_mm_hp<float4x4, 1, dequantize_f32, float, float4x4>) mul_mm_hp_t;
+
+template [[host_name("kernel_mul_mm_f32_f32_hp")]]  kernel mul_mm_hp_t kernel_mul_mm_hp<float4x4,   1,     dequantize_f32,  float, float4x4>;
+template [[host_name("kernel_mul_mm_f16_f32_hp")]]  kernel mul_mm_hp_t kernel_mul_mm_hp<half4x4,    1,     dequantize_f16,  half,  half4x4>;
+template [[host_name("kernel_mul_mm_q4_K_f32_hp")]] kernel mul_mm_hp_t kernel_mul_mm_hp<block_q4_K, QK_NL, dequantize_q4_K, float, float4x4>;
+template [[host_name("kernel_mul_mm_q5_K_f32_hp")]] kernel mul_mm_hp_t kernel_mul_mm_hp<block_q5_K, QK_NL, dequantize_q5_K, float, float4x4>;
+template [[host_name("kernel_mul_mm_q6_K_f32_hp")]] kernel mul_mm_hp_t kernel_mul_mm_hp<block_q6_K, QK_NL, dequantize_q6_K, float, float4x4>;
+template [[host_name("kernel_mul_mm_q8_0_f32_hp")]] kernel mul_mm_hp_t kernel_mul_mm_hp<block_q8_0, 2,     dequantize_q8_0, float, float4x4>;
 
 //
 // indirect matrix-matrix multiplication

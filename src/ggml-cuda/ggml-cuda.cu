@@ -12,6 +12,7 @@
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/concat.cuh"
 #include "ggml-cuda/conv-transpose-1d.cuh"
+#include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
@@ -197,6 +198,41 @@ static int ggml_cuda_parse_id(char devName[]) {
 
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
+
+    // Runtime-vs-compile-time CUDA version check (#152).  A major-version
+    // mismatch (e.g. binary built with CUDA 12 headers but running against
+    // a CUDA 13 runtime, or vice-versa) causes silent heap corruption that
+    // manifests as random crashes far from the real cause.  Catch it early.
+#if defined(CUDART_VERSION) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    {
+        int runtime_version = 0;
+        cudaError_t ver_err = cudaRuntimeGetVersion(&runtime_version);
+        if (ver_err == cudaSuccess) {
+            const int compile_major = CUDART_VERSION / 1000;
+            const int runtime_major = runtime_version / 1000;
+            if (compile_major != runtime_major) {
+                GGML_LOG_ERROR(
+                    "%s: CUDA version mismatch — compiled against CUDA %d (CUDART %d) "
+                    "but runtime reports CUDA %d (cudart %d). "
+                    "This will cause crashes. Rebuild with matching CUDA headers/libs, "
+                    "or set LD_LIBRARY_PATH to point at the CUDA %d runtime. "
+                    "See https://github.com/CrispStrobe/CrispASR/issues/152\n",
+                    __func__, compile_major, CUDART_VERSION,
+                    runtime_major, runtime_version, compile_major);
+                return info;  // don't touch the GPU — the heap is already at risk
+            }
+            const int compile_minor = (CUDART_VERSION % 1000) / 10;
+            const int runtime_minor = (runtime_version % 1000) / 10;
+            if (compile_minor != runtime_minor) {
+                GGML_LOG_WARN(
+                    "%s: CUDA minor version mismatch — compiled %d.%d, runtime %d.%d. "
+                    "This usually works but may cause subtle issues.\n",
+                    __func__, compile_major, compile_minor,
+                    runtime_major, runtime_minor);
+            }
+        }
+    }
+#endif
 
     cudaError_t err = cudaGetDeviceCount(&info.device_count);
     if (err != cudaSuccess) {
@@ -1502,7 +1538,30 @@ static void ggml_cuda_op_mul_mat_cublas(
         (src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&
         ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] &&
-        dst->op_params[0] == GGML_PREC_DEFAULT;
+        dst->op_params[0] == GGML_PREC_DEFAULT &&
+        // CrispASR patch (issue #38 + #125; MUST RE-APPLY on ggml sync).
+        //
+        // The F16 cuBLAS path dequantizes/converts both weight and activation
+        // to F16, then calls cublasHgemm. On GPUs without F32 accumulation
+        // hardware (P100 sm_60, and cuBLAS F16 GEMM on most arches) the dot-
+        // product partial sums are accumulated in F16 (max ±65504). Two
+        // failure modes:
+        //
+        //   1. F16 weight × F32 activation: the F32→F16 conversion saturates
+        //      activations > 65504 to ±Inf. Deep encoders (funasr SANM, 70
+        //      layers) produce activations past that threshold (issue #38).
+        //
+        //   2. Quantized weight × F32 activation on GPUs where MMQ is not
+        //      available (sm_60 lacks DP4A → MMQ disabled → cuBLAS fallback):
+        //      even though individual values fit in F16, the dot-product
+        //      partial sums over 3072 elements can exceed 65504, producing
+        //      Inf. This manifests as 1 Inf at LLM layer 2's FFN down
+        //      projection in funasr's Qwen2-0.6B decoder (issue #125).
+        //
+        // Fix: when src1 is F32, always fall through to the F32 cublasSgemm
+        // path (dequant weight to F32, keep activation F32). This is slightly
+        // slower but numerically correct.
+        !(src1->type == GGML_TYPE_F32);
 
     if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
@@ -2771,12 +2830,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_GLU_OP_GEGLU_QUICK:
                     ggml_cuda_op_geglu_quick(ctx, dst);
                     break;
+                case GGML_GLU_OP_SIGLU:
+                    ggml_cuda_op_siglu(ctx, dst);
+                    break;
                 default:
                     return false;
             }
             break;
         case GGML_OP_NORM:
             ggml_cuda_op_norm(ctx, dst);
+            break;
+        case GGML_OP_NORM_AFFINE:
+            ggml_cuda_op_norm_affine(ctx, dst);
             break;
         case GGML_OP_GROUP_NORM:
             ggml_cuda_op_group_norm(ctx, dst);
@@ -2888,6 +2953,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_CONV_TRANSPOSE_1D:
             ggml_cuda_op_conv_transpose_1d(ctx,dst);
+            break;
+        case GGML_OP_COL2IM_1D:
+            ggml_cuda_op_col2im_1d(ctx, dst);
             break;
         case GGML_OP_POOL_2D:
             ggml_cuda_op_pool2d(ctx, dst);
@@ -3118,6 +3186,21 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
             }
+        }
+
+        // [TAG_GET_ROWS_CUDA_GRAPHS]
+        // GET_ROWS on a k-quant source (e.g. quantized token-embedding lookup)
+        // routes through get_rows_cuda_kquant, which copies the index tensor
+        // D2H and calls cudaStreamSynchronize to read it on the host before
+        // launching per-row dequant kernels (see getrows.cu). A host sync is
+        // illegal inside cudaStreamBeginCapture/EndCapture, so any graph
+        // containing such an op must not be captured. Legacy (Q4_0 etc.) and
+        // F16/F32 GET_ROWS use the capture-safe k_get_rows path and are fine.
+        if (node->op == GGML_OP_GET_ROWS && node->src[0] && ggml_is_quantized(node->src[0]->type)) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to quantized GET_ROWS\n", __func__);
+#endif
         }
 
         if (!use_cuda_graph) {
@@ -4897,6 +4980,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_SIGLU:
                     return ggml_is_contiguous_1(op->src[0]);
                 default:
                     return false;
@@ -4984,6 +5068,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q2_K:
+                    case GGML_TYPE_Q3_K:
+                    case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q5_K:
+                    case GGML_TYPE_Q6_K:
                         return true;
                     default:
                         return false;
@@ -5090,7 +5179,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
-                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+                if ((src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16) && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                return false;
+            } break;
+        case GGML_OP_COL2IM_1D:
+            {
+                ggml_type src0_type = op->src[0]->type;
+                if (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16 || src0_type == GGML_TYPE_BF16) {
                     return true;
                 }
                 return false;
@@ -5099,6 +5196,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
             break;
         case GGML_OP_NORM:
+        case GGML_OP_NORM_AFFINE:
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
             return true;

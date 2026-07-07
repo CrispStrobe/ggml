@@ -809,6 +809,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_swiglu_oai[2];
     vk_pipeline pipeline_geglu_erf[2];
     vk_pipeline pipeline_geglu_quick[2];
+    vk_pipeline pipeline_siglu[2];
 
     vk_pipeline pipeline_leaky_relu_f32;
     vk_pipeline pipeline_silu_back_f32;
@@ -840,6 +841,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
     vk_pipeline pipeline_timestep_embedding_f32;
     vk_pipeline pipeline_conv_transpose_1d_f32;
+    vk_pipeline pipeline_conv_transpose_1d_f16;
+    vk_pipeline pipeline_col2im_1d_f32;
     vk_pipeline pipeline_pool2d_f32;
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
@@ -1463,6 +1466,17 @@ struct vk_op_conv_transpose_1d_push_constants {
     uint32_t nb1;
 
     int32_t s0;
+};
+
+struct vk_op_col2im_1d_push_constants {
+    uint32_t T_in;
+    uint32_t T_out;
+    uint32_t OC;
+    uint32_t K;
+    uint32_t K_OC;
+    int32_t  s0;
+    int32_t  p0;
+    uint32_t total;
 };
 
 struct vk_op_pool2d_push_constants {
@@ -4649,6 +4663,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     CREATE_GLU(swiglu_oai)
     CREATE_GLU(geglu_erf)
     CREATE_GLU(geglu_quick)
+    CREATE_GLU(siglu)
 #undef CREATE_GLU
 
     ggml_vk_create_pipeline(device, device->pipeline_leaky_relu_f32, "leaky_relu_f32", leaky_relu_f32_len, leaky_relu_f32_data, "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -4754,6 +4769,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_timestep_embedding_f32, "timestep_embedding_f32", timestep_embedding_f32_len, timestep_embedding_f32_data, "main", 2, sizeof(vk_op_timestep_embedding_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_conv_transpose_1d_f32, "conv_transpose_1d_f32", conv_transpose_1d_f32_len, conv_transpose_1d_f32_data, "main", 3, sizeof(vk_op_conv_transpose_1d_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_conv_transpose_1d_f16, "conv_transpose_1d_f16", conv_transpose_1d_f16_len, conv_transpose_1d_f16_data, "main", 3, sizeof(vk_op_conv_transpose_1d_push_constants), {1, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f32, "col2im_1d_f32", col2im_1d_f32_len, col2im_1d_f32_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
 
@@ -5140,7 +5158,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
-        device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+        // CrispASR: GGML_VK_FORCE_NON_UMA=1 pretends the device is discrete so the
+        // staging-buffer/transfer paths can be exercised (and raced) on UMA
+        // hardware — used to reproduce issue #215 on MoltenVK.
+        device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu &&
+                      getenv("GGML_VK_FORCE_NON_UMA") == nullptr;
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
@@ -5181,7 +5203,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->coopmat_support = false;
         }
 
-        device->integer_dot_product = device->integer_dot_product && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated;
+        // CrispASR patch: GGML_VK_FORCE_INTEGER_DOT_PRODUCT=1 keeps the int-dot
+        // path enabled on devices that expose the extension without the
+        // "accelerated" property bit (e.g. MoltenVK) — diagnostics only.
+        device->integer_dot_product = device->integer_dot_product &&
+            (shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated ||
+             getenv("GGML_VK_FORCE_INTEGER_DOT_PRODUCT") != nullptr);
 
         device->min_imported_host_pointer_alignment = external_memory_host_props.minImportedHostPointerAlignment;
 
@@ -5834,8 +5861,10 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     const size_t subgroup_size = (default_subgroup_size != 0) ? default_subgroup_size : subgroup_props.subgroupSize;
     const bool uma = props2.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
 
+    // CrispASR patch: see GGML_VK_FORCE_INTEGER_DOT_PRODUCT above (diagnostics only).
     integer_dot_product = integer_dot_product
-                       && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated
+                       && (shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated ||
+                           getenv("GGML_VK_FORCE_INTEGER_DOT_PRODUCT") != nullptr)
                        && shader_integer_dot_product_features.shaderIntegerDotProduct;
 
     coopmat_support = coopmat_support
@@ -9647,6 +9676,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 return ctx->device->pipeline_geglu_erf[dst->type == GGML_TYPE_F16];
             case GGML_GLU_OP_GEGLU_QUICK:
                 return ctx->device->pipeline_geglu_quick[dst->type == GGML_TYPE_F16];
+            case GGML_GLU_OP_SIGLU:
+                return ctx->device->pipeline_siglu[dst->type == GGML_TYPE_F16];
             default:
                 break;
         }
@@ -9797,8 +9828,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_CONV_TRANSPOSE_1D:
+        if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_conv_transpose_1d_f16;
+        }
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_conv_transpose_1d_f32;
+        }
+        return nullptr;
+    case GGML_OP_COL2IM_1D:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_col2im_1d_f32;
         }
         return nullptr;
     case GGML_OP_POOL_2D:
@@ -10205,6 +10244,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_CONV_TRANSPOSE_1D:
         {
             elements = {uint32_t(src0->ne[1]), 1, 1}; // parallelize in {Cout, 1, 1}
+        } break;
+    case GGML_OP_COL2IM_1D:
+        {
+            elements = {uint32_t(dst->ne[0]) * uint32_t(dst->ne[1]), 1, 1}; // one thread per output element
         } break;
     case GGML_OP_POOL_2D:
         {
@@ -11929,17 +11972,18 @@ static void ggml_vk_timestep_embedding(ggml_backend_vk_context * ctx, vk_context
 }
 
 static void ggml_vk_conv_transpose_1d(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // src0: (K, Cout, Cin, 1) -- kernel
-    // src1: (L, Cin, 1, 1) -- input
+    // src0: (K, Cout, Cin, 1) -- kernel (F32 or F16)
+    // src1: (L, Cin, 1, 1) -- input (F32)
     // dst: (*, Cout, 1, 1)
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT(nb00 == sizeof(float));
+    const size_t src0_elem_size = ggml_type_size(src0->type);
+    GGML_ASSERT(nb00 == src0_elem_size);
     GGML_ASSERT(nb10 == sizeof(float));
 
     const int32_t s0 = dst->op_params[0];
@@ -11950,13 +11994,39 @@ static void ggml_vk_conv_transpose_1d(ggml_backend_vk_context * ctx, vk_context&
     p.K = static_cast<uint32_t>(ne00);
     p.L = static_cast<uint32_t>(ne10);
     p.KL = static_cast<uint32_t>(ne0);
-    p.nb01 = static_cast<uint32_t>(nb01 / nb00);
-    p.nb02 = static_cast<uint32_t>(nb02 / nb00);
+    p.nb01 = static_cast<uint32_t>(nb01 / src0_elem_size);
+    p.nb02 = static_cast<uint32_t>(nb02 / src0_elem_size);
     p.nb11 = static_cast<uint32_t>(nb11 / nb10);
     p.nb1 = static_cast<uint32_t>(nb1 / nb0);
     p.s0 = static_cast<uint32_t>(s0);
 
     ggml_vk_op_f32(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_CONV_TRANSPOSE_1D, std::move(p));
+}
+
+static void ggml_vk_col2im_1d(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    // src0 col: [K_OC, T_in]   dst: [T_out, OC]  (GH #155)
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int32_t s0 = dst->op_params[0];
+    const int32_t OC = dst->op_params[1];
+    const int32_t p0 = dst->op_params[2];
+
+    const uint32_t K_OC  = static_cast<uint32_t>(src0->ne[0]);
+    const uint32_t T_in  = static_cast<uint32_t>(src0->ne[1]);
+    const uint32_t T_out = static_cast<uint32_t>(dst->ne[0]);
+
+    vk_op_col2im_1d_push_constants p{};
+    p.T_in  = T_in;
+    p.T_out = T_out;
+    p.OC    = static_cast<uint32_t>(OC);
+    p.K     = K_OC / static_cast<uint32_t>(OC);
+    p.K_OC  = K_OC;
+    p.s0    = s0;
+    p.p0    = p0;
+    p.total = T_out * static_cast<uint32_t>(OC);
+
+    ggml_vk_op_f32<vk_op_col2im_1d_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_COL2IM_1D, std::move(p));
 }
 
 static void ggml_vk_pool_2d(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -13319,6 +13389,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         case GGML_GLU_OP_SWIGLU_OAI:
         case GGML_GLU_OP_GEGLU_ERF:
         case GGML_GLU_OP_GEGLU_QUICK:
+        case GGML_GLU_OP_SIGLU:
             ggml_vk_glu(ctx, compute_ctx, src0, src1, node);
             break;
         default:
@@ -13403,6 +13474,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_CONV_TRANSPOSE_1D:
         ggml_vk_conv_transpose_1d(ctx, compute_ctx, src0, src1, node);
+
+        break;
+    case GGML_OP_COL2IM_1D:
+        ggml_vk_col2im_1d(ctx, compute_ctx, src0, node);
 
         break;
     case GGML_OP_POOL_2D:
@@ -15554,6 +15629,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_SIGLU:
                     return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
                            (op->src[0]->type == op->type);
@@ -16001,7 +16077,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) && op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_COL2IM_1D:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D:
         case GGML_OP_CONV_TRANSPOSE_2D:
             {

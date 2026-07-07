@@ -493,6 +493,70 @@ typedef struct {
     int16_t  r3;
 } ggml_metal_kargs_mul_mv_ext;
 
+// CrispASR patch (#83): kargs for Q8_K input quantize + Q4_K×Q8_K matmul.
+// Pre-step kernel_quantize_q8_K_f32 packs F32 input into block_q8_K format
+// matching CPU's quantize_row_q8_K_ref output. Main kernel
+// kernel_mul_mv_q4_K_q8_K then mirrors ggml_vec_dot_q4_K_q8_K_generic
+// bit-for-bit (CPU's Q4_K × Q8_K-quantised input → F32). Used when an op
+// carries GGML_PREC_F32 — see LEARNINGS §"Methodical bisect, round 2".
+typedef struct {
+    int32_t  ne00;     // hidden dim (must be % 256 == 0)
+    int32_t  ne01;     // num input rows = ne11 of the parent matmul
+    int32_t  ne02;
+    uint64_t nb01;     // input row stride (bytes), src
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  num_blocks_per_row; // ne00 / 256
+} ggml_metal_kargs_quantize_q8_K;
+
+typedef struct {
+    int32_t  ne00;     // K dim (hidden)
+    int32_t  ne01;     // M dim (output rows)
+    int32_t  ne02;
+    uint64_t nb01;     // weight row stride (bytes), src0
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne11;     // N dim (input cols / output cols)
+    int32_t  ne12;
+    int32_t  ne0;      // dst stride along M
+    int32_t  ne1;      // dst stride along N (== ne11)
+    int16_t  r2;
+    int16_t  r3;
+} ggml_metal_kargs_mul_mv_q4_K_q8_K;
+
+// CrispASR patch (#83 r9): kargs for Q8_0 input quantize + Q8_0×Q8_0 matmul.
+// Pre-step kernel_quantize_q8_0_f32 packs F32 input into block_q8_0 format
+// matching CPU's quantize_row_q8_0_ref output (32-elem blocks, F16 scale).
+// Main kernel kernel_mul_mv_q8_0_q8_0 mirrors ggml_vec_dot_q8_0_q8_0_generic
+// bit-for-bit. Used when an op carries GGML_PREC_F32 — chatterbox S3Gen UNet
+// uses Q8_0 weights × F32 input, the GPU mul_mv_ext path drifts ~1e-3 vs
+// CPU (compound F32 accumulator/round-down loss across 396 mul_mats x 10
+// CFM steps) so we mirror the CPU integer-dot path exactly.
+typedef struct {
+    int32_t  ne00;     // hidden dim (must be % 32 == 0)
+    int32_t  ne01;     // num input rows = ne11 of the parent matmul
+    int32_t  ne02;
+    uint64_t nb01;     // input row stride (bytes), src
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  num_blocks_per_row; // ne00 / 32
+} ggml_metal_kargs_quantize_q8_0;
+
+typedef struct {
+    int32_t  ne00;     // K dim (hidden)
+    int32_t  ne01;     // M dim (output rows)
+    int32_t  ne02;
+    uint64_t nb01;     // weight row stride (bytes), src0
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne11;     // N dim (input cols / output cols)
+    int32_t  ne12;
+    int32_t  ne0;      // dst stride along M
+    int32_t  ne1;      // dst stride along N (== ne11)
+    int16_t  r2;
+    int16_t  r3;
+} ggml_metal_kargs_mul_mv_q8_0_q8_0;
+
 typedef struct {
     int32_t  ne02;
     int32_t  ne10;
@@ -602,6 +666,34 @@ typedef struct {
     uint64_t nb0;
     uint64_t nb1;
 } ggml_metal_kargs_conv_transpose_1d;
+
+// CrispASR patch (PR #160 col2im_1d decomposition): kargs for the
+// col2im_1d gather kernel — scatter-adds GEMM columns to 1D signal.
+// MUST RE-APPLY after every ggml bump.
+typedef struct {
+    int32_t T_in;
+    int32_t T_out;
+    int32_t OC;
+    int32_t K;
+    int32_t K_OC;
+    int32_t s0;
+    int32_t p0;
+} ggml_metal_kargs_col2im_1d;
+
+// CrispASR patch (PR #07-metal-aa-snake-beta): kargs for the fused
+// BigVGAN v2 anti-aliased SnakeBeta kernel. K is fixed at 12 by the
+// kernel — left in kargs only for sanity-checking on the host side.
+// MUST RE-APPLY after every ggml bump.
+typedef struct {
+    int32_t T;             // sequence length per channel
+    int32_t C;             // channels (input == output)
+    int32_t K;             // filter taps (always 12 in current kernel)
+    int32_t up_pad;        // 5  — replicate-pad before upsample
+    int32_t up_pad_left;   // 15 — left crop of upsample output
+    int32_t up_pad_right;  // 15 — right crop of upsample output
+    int32_t ds_pad_left;   // 5  — replicate-pad before downsample
+    int32_t ds_pad_right;  // 6
+} ggml_metal_kargs_aa_snake_beta;
 
 typedef struct {
     int32_t  IC;

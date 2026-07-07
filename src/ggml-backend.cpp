@@ -771,6 +771,24 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// Per-call record of src[j] mutations made by
+// ggml_backend_sched_split_graph. Without restoration, repeated
+// sched_alloc_graph calls on the same user graph leave node->src[j]
+// pointing at input_cpy tensors that lived in the previous sched->ctx
+// (which is freed+reinit'd at the start of every split_graph call), so
+// the next call's input-detection loop misses the original
+// GGML_TENSOR_FLAG_INPUT tensors and sched never queues the CPU->GPU
+// copy of inputs the second time. Repro: CFG-style decoders running
+// the same gf twice per step (cond + uncond) silently use stale GPU
+// buffers on the second call.
+struct ggml_backend_sched_src_mutation {
+    struct ggml_tensor * node;
+    struct ggml_tensor * orig_src;
+    int j;
+};
+
+static void ggml_backend_sched_restore_src_mutations(ggml_backend_sched_t sched);
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -799,6 +817,13 @@ struct ggml_backend_sched {
     struct ggml_backend_sched_split * splits;
     int n_splits;
     int splits_capacity;
+
+    // Mutation log for src[j] rewires in split_graph (see the struct
+    // definition above for rationale). Allocated lazily; freed in
+    // sched_free.
+    struct ggml_backend_sched_src_mutation * src_mutations;
+    int n_src_mutations;
+    int src_mutations_capacity;
 
     // pipeline parallelism support
     int n_copies;
@@ -1016,6 +1041,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+
+    // Drop any src[j] rewires still recorded from a prior compute that
+    // returned early. Restoring writes to the user's gf, not to
+    // sched->ctx, so it is safe to call before ggml_free(sched->ctx).
+    ggml_backend_sched_restore_src_mutations(sched);
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -1367,6 +1397,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
                         split->inputs[n_inputs] = src;
                     }
+                    // Record the mutation so it can be undone on every
+                    // exit path of compute_splits.
+                    if (sched->n_src_mutations >= sched->src_mutations_capacity) {
+                        const int new_capacity = sched->src_mutations_capacity * 2 + 16;
+                        struct ggml_backend_sched_src_mutation * resized =
+                            (struct ggml_backend_sched_src_mutation *) realloc(
+                                sched->src_mutations,
+                                new_capacity * sizeof(struct ggml_backend_sched_src_mutation));
+                        GGML_ASSERT(resized != NULL);
+                        sched->src_mutations = resized;
+                        sched->src_mutations_capacity = new_capacity;
+                    }
+                    sched->src_mutations[sched->n_src_mutations].node = node;
+                    sched->src_mutations[sched->n_src_mutations].orig_src = src;
+                    sched->src_mutations[sched->n_src_mutations].j = j;
+                    sched->n_src_mutations++;
+
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
             }
@@ -1538,6 +1585,19 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Roll back the src[j] rewires recorded during split_graph so the user's
+// gf is left in its original state. Idempotent. MUST run on every exit
+// path of compute_splits (success or early error) and defensively at the
+// start of split_graph + in sched_reset to drop any entries left over by
+// a previous aborted compute.
+static void ggml_backend_sched_restore_src_mutations(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_src_mutations; i++) {
+        const struct ggml_backend_sched_src_mutation * m = &sched->src_mutations[i];
+        m->node->src[m->j] = m->orig_src;
+    }
+    sched->n_src_mutations = 0;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1677,6 +1737,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_restore_src_mutations(sched);
                 return ec;
             }
         } else {
@@ -1699,6 +1760,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    ggml_backend_sched_restore_src_mutations(sched);
                     return ec;
                 }
 
@@ -1720,6 +1782,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
     }
+
+    ggml_backend_sched_restore_src_mutations(sched);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -1815,6 +1879,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
+    free(sched->src_mutations);
     free(sched);
 }
 
@@ -1825,6 +1890,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+        ggml_backend_sched_restore_src_mutations(sched);
         sched->is_reset = true;
     }
     sched->is_alloc = false;

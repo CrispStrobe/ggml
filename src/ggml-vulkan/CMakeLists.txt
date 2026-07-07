@@ -97,6 +97,8 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_CHECK_RESULTS)
         add_compile_definitions(GGML_VULKAN_CHECK_RESULTS)
+        # The check path calls ggml_graph_compute_with_ctx (CPU reference run)
+        target_link_libraries(ggml-vulkan PRIVATE ggml-cpu)
     endif()
 
     if (GGML_VULKAN_DEBUG)

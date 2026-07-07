@@ -1078,6 +1078,12 @@ class ggml_webgpu_shader_lib {
     std::unordered_map<ggml_webgpu_upscale_pipeline_key, webgpu_pipeline, ggml_webgpu_upscale_pipeline_key_hash>
         upscale_pipelines;
 
+    // Ops not (yet) in upstream ggml-webgpu — ported from CrispEmbed. Simple/single
+    // variants keyed by an int.
+    std::unordered_map<int, webgpu_pipeline> arange_pipelines;             // single variant
+    std::unordered_map<int, webgpu_pipeline> pool2d_pipelines;             // pool op (max/avg)
+    std::unordered_map<int, webgpu_pipeline> conv_transpose_2d_pipelines;  // single variant
+
   public:
     ggml_webgpu_shader_lib(wgpu::Device device) { this->device = device; }
 
@@ -3042,6 +3048,65 @@ class ggml_webgpu_shader_lib {
         pipeline.context         = decisions;
         upscale_pipelines[key]   = pipeline;
         return upscale_pipelines[key];
+    }
+
+    // --- Ops ported from CrispEmbed (not in upstream ggml-webgpu) ---
+
+    webgpu_pipeline get_arange_pipeline(const ggml_webgpu_shader_lib_context & context) {
+        auto it = arange_pipelines.find(0);
+        if (it != arange_pipelines.end()) {
+            return it->second;
+        }
+        std::vector<std::string> defines;
+        defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
+        auto processed           = preprocessor.preprocess(wgsl_arange, defines);
+        auto decisions           = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        decisions->wg_size       = context.max_wg_size;
+        webgpu_pipeline pipeline = ggml_webgpu_create_pipeline(device, processed, "arange");
+        pipeline.context         = decisions;
+        arange_pipelines[0]      = pipeline;
+        return arange_pipelines[0];
+    }
+
+    webgpu_pipeline get_pool2d_pipeline(const ggml_webgpu_shader_lib_context & context) {
+        const int key = ggml_get_op_params_i32(context.dst, 0);  // GGML_OP_POOL_MAX=0 / AVG=1
+        auto      it  = pool2d_pipelines.find(key);
+        if (it != pool2d_pipelines.end()) {
+            return it->second;
+        }
+        std::vector<std::string> defines;
+        std::string              variant;
+        if (key == GGML_OP_POOL_MAX) {
+            defines.push_back("POOL_MAX");
+            variant = "pool2d_max";
+        } else {
+            defines.push_back("POOL_AVG");
+            variant = "pool2d_avg";
+        }
+        defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
+        auto processed           = preprocessor.preprocess(wgsl_pool2d, defines);
+        auto decisions           = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        decisions->wg_size       = context.max_wg_size;
+        webgpu_pipeline pipeline = ggml_webgpu_create_pipeline(device, processed, variant);
+        pipeline.context         = decisions;
+        pool2d_pipelines[key]    = pipeline;
+        return pool2d_pipelines[key];
+    }
+
+    webgpu_pipeline get_conv_transpose_2d_pipeline(const ggml_webgpu_shader_lib_context & context) {
+        auto it = conv_transpose_2d_pipelines.find(0);
+        if (it != conv_transpose_2d_pipelines.end()) {
+            return it->second;
+        }
+        std::vector<std::string> defines;
+        defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
+        auto processed                 = preprocessor.preprocess(wgsl_conv_transpose_2d, defines);
+        auto decisions                 = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        decisions->wg_size             = context.max_wg_size;
+        webgpu_pipeline pipeline       = ggml_webgpu_create_pipeline(device, processed, "conv_transpose_2d");
+        pipeline.context               = decisions;
+        conv_transpose_2d_pipelines[0] = pipeline;
+        return conv_transpose_2d_pipelines[0];
     }
 
   private:

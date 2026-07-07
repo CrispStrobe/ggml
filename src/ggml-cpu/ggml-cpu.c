@@ -212,9 +212,15 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
     },
     [GGML_TYPE_F16] = {
+        // CrispASR patch (issue #38): vec_dot_type=F32 + ggml_vec_dot_f16_f32
+        // avoids converting F32 src1 to F16 before the dot product. The
+        // upstream F32->F16 saturates values above 65504 to ±Inf, producing
+        // NaN matmul outputs for any model whose intermediate activations
+        // exceed 65504 (e.g. qwen3-tts code_pred ffn_down sees silu(gate)*up
+        // up to ~140000). MUST RE-APPLY after every ggml bump.
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp16,
-        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f16,
-        .vec_dot_type             = GGML_TYPE_F16,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f16_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q1_0] = {
@@ -1798,6 +1804,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_norm(params, tensor);
             } break;
+        case GGML_OP_NORM_AFFINE:
+            {
+                ggml_compute_forward_norm_affine(params, tensor);
+            } break;
         case GGML_OP_RMS_NORM:
             {
                 ggml_compute_forward_rms_norm(params, tensor);
@@ -1889,6 +1899,15 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
                 ggml_compute_forward_conv_transpose_1d(params, tensor);
+            } break;
+        case GGML_OP_COL2IM_1D:
+            {
+                ggml_compute_forward_col2im_1d(params, tensor);
+            } break;
+        // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
+        case GGML_OP_AA_SNAKE_BETA:
+            {
+                ggml_compute_forward_aa_snake_beta(params, tensor);
             } break;
         case GGML_OP_IM2COL:
             {
@@ -2269,6 +2288,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_SIGLU:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2280,6 +2300,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_NORM:
+        case GGML_OP_NORM_AFFINE:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:
@@ -2334,7 +2355,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONV_3D:
         case GGML_OP_CONV_2D_DW:
         case GGML_OP_CONV_TRANSPOSE_1D:
+        case GGML_OP_COL2IM_1D:
         case GGML_OP_CONV_TRANSPOSE_2D:
+        // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
+        case GGML_OP_AA_SNAKE_BETA:
             {
                 n_tasks = n_threads;
             } break;
@@ -2865,6 +2889,9 @@ struct ggml_cplan ggml_graph_plan(
                             GGML_ABORT("fatal error");
                         }
                     } break;
+                case GGML_OP_COL2IM_1D:
+                    // no work buffer needed — gather-only kernel
+                    break;
                 case GGML_OP_CONV_2D:
                 case GGML_OP_CONV_3D:
                     {

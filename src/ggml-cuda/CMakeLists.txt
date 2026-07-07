@@ -134,6 +134,10 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()
 
+    if (GGML_CUDA_CRISPASR_FA_PERHEAD_MASK)
+        add_compile_definitions(GGML_CUDA_CRISPASR_FA_PERHEAD_MASK)
+    endif()
+
     if (GGML_CUDA_FORCE_MMQ)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
     endif()

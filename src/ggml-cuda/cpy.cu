@@ -43,7 +43,8 @@ template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
                                const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
-                               const int64_t nb12, const int64_t nb13) {
+                               const int64_t nb12, const int64_t nb13,
+                               const int y_block_offset) {
 
     const T* src = reinterpret_cast<const T*>(cx);
     T* dst = reinterpret_cast<T*>(cdst);
@@ -51,9 +52,13 @@ static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const 
     const int64_t nmat = ne / (ne00 * ne01);
     const int64_t n = ne00 * ne01;
 
+    // CrispASR patch (GH #65): large ne00 forces grid_y past USHRT_MAX-1
+    // so the host tiles the launch and passes y_block_offset to splice
+    // tiles back into a single logical grid. Single-launch case y_block_offset=0.
+    const int by = blockIdx.y + y_block_offset;
     const int x = blockIdx.x * CUDA_CPY_TILE_DIM_2D + threadIdx.x;
-    const int y = blockIdx.y * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
-    const int tx = blockIdx.y * CUDA_CPY_TILE_DIM_2D + threadIdx.x;  // transpose block offset
+    const int y = by * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
+    const int tx = by * CUDA_CPY_TILE_DIM_2D + threadIdx.x;  // transpose block offset
     const int ty = blockIdx.x * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
 
     __shared__ float tile[2][CUDA_CPY_TILE_DIM_2D][CUDA_CPY_TILE_DIM_2D+1];
@@ -215,16 +220,34 @@ static void ggml_cpy_scalar_cuda(
             ne02n = 1;
         }
 
-        int64_t grid_x = (ne01n + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
-        int64_t grid_y = (ne00n + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
-        int64_t grid_z = (ne/(ne01n*ne00n) + CUDA_CPY_BLOCK_NM - 1) / CUDA_CPY_BLOCK_NM;
+        const int64_t grid_x       = (ne01n + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
+        const int64_t grid_y_total = (ne00n + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
+        const int64_t grid_z       = (ne/(ne01n*ne00n) + CUDA_CPY_BLOCK_NM - 1) / CUDA_CPY_BLOCK_NM;
         GGML_ASSERT(grid_x < UINT_MAX);
-        GGML_ASSERT(grid_y < USHRT_MAX);
         GGML_ASSERT(grid_z < USHRT_MAX);
-        dim3 dimGrid(grid_x, grid_y, grid_z);
-        dim3 dimBlock(CUDA_CPY_TILE_DIM_2D, CUDA_CPY_BLOCK_ROWS, 1);
-        cpy_scalar_transpose<dst_t><<<dimGrid, dimBlock, 0, stream>>>
-            (cx, cdst, ne, ne00n, ne01n, ne02n, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+        GGML_ASSERT(grid_y_total <= INT_MAX);
+
+        // CrispASR patch (GH #65): when ne00n is huge (qwen3-tts codec
+        // emits [T_pcm, 1, 1, 1] with T_pcm ≈ 2.88M on CUDA), grid_y
+        // would exceed USHRT_MAX. Tile the launch along y in chunks of
+        // USHRT_MAX-1; bit-identical, transposed-tile coalescing
+        // preserved on every chunk. See LEARNINGS.md "ggml fork patches
+        // we carry".
+        constexpr int64_t MAX_GRID_Y = USHRT_MAX - 1;
+        const int64_t n_chunks = (grid_y_total + MAX_GRID_Y - 1) / MAX_GRID_Y;
+        if (n_chunks > 1) {
+            GGML_LOG_DEBUG("ggml_cuda_cpy: tiling transposed cpy along grid_y (ne00n=%lld, grid_y_total=%lld -> %lld launches)\n",
+                           (long long)ne00n, (long long)grid_y_total, (long long)n_chunks);
+        }
+        const dim3 dimBlock(CUDA_CPY_TILE_DIM_2D, CUDA_CPY_BLOCK_ROWS, 1);
+        for (int64_t y_off = 0; y_off < grid_y_total; y_off += MAX_GRID_Y) {
+            const int64_t remaining   = grid_y_total - y_off;
+            const int64_t grid_y_this = remaining < MAX_GRID_Y ? remaining : MAX_GRID_Y;
+            const dim3 dimGrid((unsigned int)grid_x, (unsigned int)grid_y_this, (unsigned int)grid_z);
+            cpy_scalar_transpose<dst_t><<<dimGrid, dimBlock, 0, stream>>>
+                (cx, cdst, ne, ne00n, ne01n, ne02n, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13,
+                 (int)y_off);
+        }
     } else {
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks < UINT_MAX);

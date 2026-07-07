@@ -420,9 +420,26 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+    // CrispASR: allow per-head additive masks; only the MMA-F16 kernel body has been
+    // patched to consume nb32. Other kernels (VEC/TILE/WMMA-F16) still broadcast the
+    // mask across heads, so we force per-head-mask cases to fall through to MMA-F16
+    // or, on arches where MMA-F16 is not reachable, to CPU fallback (NONE).
+    //
+    // The MMA-F16 mask offset patch (fattn-mma-f16.cuh) is only correct for
+    // ncols2 == 1 — when gqa_ratio > 1 the launcher may fold multiple Q heads
+    // into one tile (ncols2 > 1) and our per-tile offset would broadcast head
+    // zt_Q's mask across the folded heads. Force CPU fallback for that case
+    // (== upstream pre-patch behaviour, no regression).
+    const bool mask_is_per_head = (mask && mask->ne[2] != 1);
+    if (mask_is_per_head && gqa_ratio > 1) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+#else
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
     }
+#endif
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
@@ -432,20 +449,32 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+                    if (!mask_is_per_head)
+#endif
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     if (Q->ne[1] <= 2) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+                        if (!mask_is_per_head)
+#endif
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
                     if (Q->ne[1] == 1) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+                        if (!mask_is_per_head)
+#endif
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 }
             }
             if (!gqa_opt_applies && Q->ne[1] == 1) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+                if (!mask_is_per_head)
+#endif
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
@@ -459,9 +488,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             gqa_ratio_eff *= 2;
         }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+            if (!mask_is_per_head)
+#endif
             return BEST_FATTN_KERNEL_VEC;
         }
         if (Q->ne[1] * gqa_ratio_eff <= 16) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+            if (!mask_is_per_head)
+#endif
             return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
         }
         return BEST_FATTN_KERNEL_MMA_F16;
@@ -470,8 +505,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // Use the WMMA kernel if possible:
     if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 512 && Q->ne[0] != 576) {
         if (can_use_vector_kernel && Q->ne[1] <= 2) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+            if (!mask_is_per_head)
+#endif
             return BEST_FATTN_KERNEL_VEC;
         }
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+        // WMMA-F16 doesn't yet consume per-head mask strides; fall through to
+        // NONE (CPU fallback) via the safety net at the end of this function.
+        if (!mask_is_per_head)
+#endif
         return BEST_FATTN_KERNEL_WMMA_F16;
     }
 
@@ -480,11 +523,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (Q->ne[1] == 1) {
                     if (!gqa_opt_applies) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+                        if (!mask_is_per_head)
+#endif
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 }
             } else {
                 if (Q->ne[1] <= 2) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+                    if (!mask_is_per_head)
+#endif
                     return BEST_FATTN_KERNEL_VEC;
                 }
             }
@@ -495,6 +544,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             gqa_ratio_eff *= 2;
         }
         if (Q->ne[1] * gqa_ratio_eff <= 8) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+            if (!mask_is_per_head)
+#endif
             return BEST_FATTN_KERNEL_TILE; // AMD WMMA is only faster if the full tile width of 16 can be utilized.
         }
         return BEST_FATTN_KERNEL_MMA_F16;
@@ -517,15 +569,29 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
                 if (!gqa_opt_applies) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+                    if (!mask_is_per_head)
+#endif
                     return BEST_FATTN_KERNEL_VEC;
                 }
             }
         } else {
             if (Q->ne[1] <= 2) {
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+                if (!mask_is_per_head)
+#endif
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
     }
+#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+    // Safety net: per-head masks reaching this point have no MMA-F16 fallback on
+    // this arch (e.g. WMMA-only Pascal, or generic-tile CPU). Return NONE so the
+    // scheduler falls back to CPU FA — same behaviour as upstream pre-patch.
+    if (mask_is_per_head) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+#endif
     return BEST_FATTN_KERNEL_TILE;
 }
 

@@ -115,7 +115,12 @@ if (NOT GGML_LLAMAFILE_DEFAULT)
 endif()
 
 if (NOT GGML_CUDA_GRAPHS_DEFAULT)
-    set(GGML_CUDA_GRAPHS_DEFAULT OFF)
+    # CrispASR: enable CUDA graphs by default. Capture is arch-gated to
+    # sm_80+ inside ggml-cuda (graph_check_compute_cap), so older GPUs are
+    # unaffected. Eliminates per-launch dispatch overhead for launch-bound
+    # decode loops (e.g. granite-speech LLM decode, see PERFORMANCE.md).
+    # Runtime escape hatch: GGML_CUDA_DISABLE_GRAPHS=1.
+    set(GGML_CUDA_GRAPHS_DEFAULT ON)
 endif()
 
 # general
@@ -208,6 +213,9 @@ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention C
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
+option(GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
+                                            "CrispASR: allow per-head additive mask in CUDA FlashAttention (MMA-F16 path)"
+                                                                                              OFF)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")

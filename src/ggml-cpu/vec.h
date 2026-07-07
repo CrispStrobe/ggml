@@ -42,6 +42,10 @@ extern ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
 void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc);
 void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc);
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc);
+// CrispASR patch (issue #38): F16 weight × F32 input → F32 dot, used by
+// MUL_MAT when src0 is F16 and src1 is F32. Avoids saturating F32 → F16
+// quantize on the input side. MUST RE-APPLY after every ggml bump.
+void ggml_vec_dot_f16_f32(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, float * GGML_RESTRICT y, size_t by, int nrc);
 
 void ggml_vec_silu_f32(const int n, float * y, const float * x);
 ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const float mean); //it will also center y ( y = y - mean )
@@ -1507,6 +1511,20 @@ inline static void ggml_vec_geglu_quick_f16(const int n, ggml_fp16_t * y, const 
     for (int i = 0; i < n; ++i) {
         float v = GGML_CPU_FP16_TO_FP32(g[i]);
         y[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(ggml_table_gelu_quick_f16[i16[i]]) * v);
+    }
+}
+
+inline static void ggml_vec_siglu_f32(const int n, float * y, const float * x, const float * g) {
+    for (int i = 0; i < n; ++i) {
+        y[i] = (1.0f / (1.0f + expf(-x[i]))) * g[i];
+    }
+}
+
+inline static void ggml_vec_siglu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
+    for (int i = 0; i < n; ++i) {
+        float xi = GGML_CPU_FP16_TO_FP32(x[i]);
+        float gi = GGML_CPU_FP16_TO_FP32(g[i]);
+        y[i] = GGML_CPU_FP32_TO_FP16((1.0f / (1.0f + expf(-xi))) * gi);
     }
 }
 

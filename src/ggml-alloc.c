@@ -18,6 +18,44 @@
 //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
 #define AT_PRINTF(...)
 
+// Per-node allocator trace. Gated by CRISPASR_GGML_ALLOC_TRACE=1. Emits one
+// line per allocate/free decision in a diffable format. Use
+// CRISPASR_GGML_ALLOC_TRACE_MAX_PASSES=N to cap (sched runs the allocator
+// per backend split, so many small splits fire before the UNet one).
+static int  s_alloc_trace_passes_seen = 0;
+static int  s_alloc_trace_max_passes  = -1;  // -1 = uninitialized
+static bool s_alloc_trace_active      = false;
+
+static bool ggml_alloc_trace_init_env(void) {
+    if (s_alloc_trace_max_passes == -1) {
+        const char * env = getenv("CRISPASR_GGML_ALLOC_TRACE");
+        if (env && *env) {
+            const char * max_env = getenv("CRISPASR_GGML_ALLOC_TRACE_MAX_PASSES");
+            s_alloc_trace_max_passes = max_env ? atoi(max_env) : INT_MAX;
+        } else {
+            s_alloc_trace_max_passes = 0;
+        }
+    }
+    return s_alloc_trace_max_passes > 0;
+}
+
+static void ggml_alloc_trace_pass_begin(int n_nodes, int n_leafs) {
+    int pass_idx = s_alloc_trace_passes_seen++;
+    s_alloc_trace_active = ggml_alloc_trace_init_env() && pass_idx < s_alloc_trace_max_passes;
+    if (s_alloc_trace_active) {
+        fprintf(stderr, "ggml-alloc: [TRACE] PASS pass=%d n_nodes=%d n_leafs=%d\n",
+                pass_idx, n_nodes, n_leafs);
+    }
+}
+
+static void ggml_alloc_trace_pass_end(void) {
+    if (s_alloc_trace_active) {
+        fprintf(stderr, "ggml-alloc: [TRACE] PASS_END pass=%d\n",
+                s_alloc_trace_passes_seen - 1);
+        s_alloc_trace_active = false;
+    }
+}
+
 // ops that return true for this function must not use restrict pointers for their backend implementations
 bool ggml_op_can_inplace(enum ggml_op op) {
     switch (op) {
@@ -665,6 +703,14 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                             p_hn->allocated = false; // avoid freeing the parent
                             view_src_hn->allocated = false;
                             ggml_gallocr_free_extra_space(galloc, node, view_src);
+                            if (s_alloc_trace_active) {
+                                size_t size = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
+                                fprintf(stderr,
+                                    "ggml-alloc: [TRACE] ALLOC_REUSE_VIEW node=%s op=%s buf=%d chunk=%d offset=%zu size=%zu inplace_from=%s view_src=%s\n",
+                                    node->name, ggml_op_name(node->op), hn->buffer_id,
+                                    hn->addr.chunk, hn->addr.offset, size,
+                                    parent->name, view_src->name);
+                            }
                             return;
                         }
                     } else {
@@ -673,6 +719,13 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                         hn->addr = p_hn->addr;
                         p_hn->allocated = false; // avoid freeing the parent
                         ggml_gallocr_free_extra_space(galloc, node, parent);
+                        if (s_alloc_trace_active) {
+                            size_t size = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
+                            fprintf(stderr,
+                                "ggml-alloc: [TRACE] ALLOC_REUSE node=%s op=%s buf=%d chunk=%d offset=%zu size=%zu inplace_from=%s view_src=-\n",
+                                node->name, ggml_op_name(node->op), hn->buffer_id,
+                                hn->addr.chunk, hn->addr.offset, size, parent->name);
+                        }
                         return;
                     }
                 }
@@ -684,6 +737,12 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
         hn->buffer_id = buffer_id;
         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
+        if (s_alloc_trace_active) {
+            fprintf(stderr,
+                "ggml-alloc: [TRACE] ALLOC node=%s op=%s buf=%d chunk=%d offset=%zu size=%zu inplace_from=- view_src=-\n",
+                node->name, ggml_op_name(node->op), buffer_id,
+                hn->addr.chunk, hn->addr.offset, size);
+        }
     }
 }
 
@@ -691,6 +750,13 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     // graph outputs are never freed
     if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
         AT_PRINTF("not freeing output %s\n", node->name);
+        if (s_alloc_trace_active) {
+            struct hash_node * hn_out = ggml_gallocr_hash_get(galloc, node);
+            size_t size = ggml_backend_buft_get_alloc_size(galloc->bufts[hn_out->buffer_id], node);
+            fprintf(stderr,
+                "ggml-alloc: [TRACE] FREE_SKIP_OUTPUT node=%s buf=%d chunk=%d offset=%zu size=%zu\n",
+                node->name, hn_out->buffer_id, hn_out->addr.chunk, hn_out->addr.offset, size);
+        }
         return;
     }
 
@@ -702,6 +768,11 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
 
     AT_PRINTF("%s: freeing %s at {chunk=%d, offset=%zu} (%zu bytes) - n_free_blocks = %d\n",
         __func__, node->name, hn->addr.chunk, hn->addr.offset, size, alloc->chunks[hn->addr.chunk]->n_free_blocks);
+    if (s_alloc_trace_active) {
+        fprintf(stderr,
+            "ggml-alloc: [TRACE] FREE node=%s buf=%d chunk=%d offset=%zu size=%zu\n",
+            node->name, buffer_id, hn->addr.chunk, hn->addr.offset, size);
+    }
 #ifdef GGML_ALLOCATOR_DEBUG
     remove_allocated_tensor(alloc, hn->addr, node);
 #endif
@@ -718,6 +789,8 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+
+    ggml_alloc_trace_pass_begin(graph->n_nodes, graph->n_leafs);
 
     // allocate leafs
     // these may be tensors that the application is not using in the graph, but may still want to allocate for other purposes
@@ -819,6 +892,8 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             AT_PRINTF("\n");
         }
     }
+
+    ggml_alloc_trace_pass_end();
 }
 
 static bool ggml_gallocr_reserve_n_impl(

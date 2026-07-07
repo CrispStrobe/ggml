@@ -999,6 +999,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CONCAT",
     "SILU_BACK",
     "NORM",
+    "NORM_AFFINE",
     "RMS_NORM",
     "RMS_NORM_BACK",
     "GROUP_NORM",
@@ -1028,6 +1029,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ROPE_BACK",
     "CLAMP",
     "CONV_TRANSPOSE_1D",
+    "COL2IM_1D",
     "IM2COL",
     "IM2COL_BACK",
     "IM2COL_3D",
@@ -1078,9 +1080,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
+    "AA_SNAKE_BETA",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1109,6 +1114,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "concat(x, y)",
     "silu_back(x)",
     "norm(x)",
+    "w*norm(x)+b",
     "rms_norm(x)",
     "rms_norm_back(x)",
     "group_norm(x)",
@@ -1138,6 +1144,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rope_back(x)",
     "clamp(x)",
     "conv_transpose_1d(x)",
+    "col2im_1d(x)",
     "im2col(x)",
     "im2col_back(x)",
     "im2col_3d(x)",
@@ -1188,9 +1195,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
+    "aa_snake_beta(x, log_a, log_b, usf, dsf)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1228,9 +1238,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "SWIGLU_OAI",
     "GEGLU_ERF",
     "GEGLU_QUICK",
+    "SIGLU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
+static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
 
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
@@ -3068,6 +3079,27 @@ struct ggml_tensor * ggml_geglu_quick_split(
     return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_GEGLU_QUICK, false);
 }
 
+// ggml_siglu
+
+struct ggml_tensor * ggml_siglu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    return ggml_glu_impl(ctx, a, NULL, GGML_GLU_OP_SIGLU, false);
+}
+
+struct ggml_tensor * ggml_siglu_swapped(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    return ggml_glu_impl(ctx, a, NULL, GGML_GLU_OP_SIGLU, true);
+}
+
+struct ggml_tensor * ggml_siglu_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SIGLU, false);
+}
+
 struct ggml_tensor * ggml_swiglu_oai(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -3110,6 +3142,29 @@ struct ggml_tensor * ggml_norm_inplace(
         struct ggml_tensor  * a,
         float                 eps) {
     return ggml_norm_impl(ctx, a, eps, true);
+}
+
+// ggml_norm_affine
+
+struct ggml_tensor * ggml_norm_affine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * b,
+        float                 eps) {
+    GGML_ASSERT(ggml_are_same_shape(a, w) || (w->ne[0] == a->ne[0] && ggml_nelements(w) == a->ne[0]));
+    GGML_ASSERT(ggml_are_same_shape(a, b) || (b->ne[0] == a->ne[0] && ggml_nelements(b) == a->ne[0]));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params(result, &eps, sizeof(eps));
+
+    result->op     = GGML_OP_NORM_AFFINE;
+    result->src[0] = a;
+    result->src[1] = w;
+    result->src[2] = b;
+
+    return result;
 }
 
 // ggml_rms_norm
@@ -4477,12 +4532,21 @@ struct ggml_tensor * ggml_conv_1d(
         int                   s0,
         int                   p0,
         int                   d0) {
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F16); // [N, OL, IC * K]
+    // CrispASR fork (issue #38 companion): pick im2col output type based on
+    // whether either side is F32. Upstream hardcodes F16, which produces
+    // MUL_MAT(F16, F16) — unsupported by the CPU backend after our F16
+    // vec_dot_type=F32 change. Cast the kernel to F32 too so the resulting
+    // MUL_MAT has F32 src1. MUST RE-APPLY after every ggml bump.
+    const enum ggml_type im2col_type = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32) ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, im2col_type); // [N, OL, IC * K]
+
+    struct ggml_tensor * a_mat = (im2col_type == GGML_TYPE_F32 && a->type != GGML_TYPE_F32) ?
+                                     ggml_cast(ctx, a, GGML_TYPE_F32) : a;
 
     struct ggml_tensor * result =
         ggml_mul_mat(ctx,
                 ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])), // [N, OL, IC * K] => [N*OL, IC * K]
-                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));                    // [OC，IC, K] => [OC, IC * K]
+                ggml_reshape_2d(ctx, a_mat, (a_mat->ne[0] * a_mat->ne[1]), a_mat->ne[2]));    // [OC, IC, K] => [OC, IC * K]
 
     result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
 
@@ -4511,9 +4575,16 @@ struct ggml_tensor * ggml_conv_1d_dw(
         int                   d0) {
     struct ggml_tensor * new_b = ggml_reshape_4d(ctx, b, b->ne[0], 1, b->ne[1], b->ne[2]);
 
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F16);
+    // CrispASR fork (issue #38 companion): same im2col-type handling as
+    // ggml_conv_1d. ggml_compute_forward_mul_mat requires src1 to be F32
+    // when conversion is needed; cast weight to F32 when im2col is F32 and
+    // weight is a non-F32 float type. MUST RE-APPLY after every ggml bump.
+    const enum ggml_type im2col_type = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32) ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, im2col_type);
 
-    struct ggml_tensor * result = ggml_mul_mat(ctx, im2col, a);
+    struct ggml_tensor * a_mat = (im2col_type == GGML_TYPE_F32 && a->type != GGML_TYPE_F32)
+                                     ? ggml_cast(ctx, a, GGML_TYPE_F32) : a;
+    struct ggml_tensor * result = ggml_mul_mat(ctx, im2col, a_mat);
 
     result = ggml_reshape_3d(ctx, result, result->ne[0], result->ne[2], 1);
 
@@ -4567,6 +4638,70 @@ GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
     return result;
 }
 
+// ggml_col2im_1d
+
+GGML_API struct ggml_tensor * ggml_col2im_1d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * col,
+        int                   s0,
+        int                   oc,
+        int                   p0) {
+    GGML_ASSERT(ggml_is_matrix(col));
+    GGML_ASSERT(col->ne[0] % oc == 0);
+    GGML_ASSERT(col->type == GGML_TYPE_F32 || col->type == GGML_TYPE_F16 || col->type == GGML_TYPE_BF16);
+
+    const int K_OC = (int)col->ne[0];
+    const int T_in = (int)col->ne[1];
+    const int K    = K_OC / oc;
+    const int T_out = (T_in - 1) * s0 + K - p0;
+
+    const int64_t ne[4] = { T_out, oc, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[] = { s0, oc, p0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_COL2IM_1D;
+    result->src[0] = col;
+
+    return result;
+}
+
+// ggml_aa_snake_beta
+//
+// CrispASR patch (PR #07-metal-aa-snake-beta): fused BigVGAN v2 anti-aliased
+// SnakeBeta (upsample 2× + sin²(α·x)/β + downsample 2×). All inputs F32.
+// Output has the same shape as `x` ([T, C]). The CPU forward and Metal kernel
+// assume K=12 — kept generic in the builder but asserted in the forward.
+// MUST RE-APPLY after every ggml bump.
+GGML_API struct ggml_tensor * ggml_aa_snake_beta(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * log_alpha,
+        struct ggml_tensor  * log_beta,
+        struct ggml_tensor  * us_filter,
+        struct ggml_tensor  * ds_filter) {
+    GGML_ASSERT(ggml_is_matrix(x));                  // [T, C]
+    GGML_ASSERT(log_alpha->ne[0] == x->ne[1]);       // C matches
+    GGML_ASSERT(log_beta->ne[0]  == x->ne[1]);
+    GGML_ASSERT(us_filter->ne[0] == 12);             // K fixed at 12 for now
+    GGML_ASSERT(ds_filter->ne[0] == 12);
+    GGML_ASSERT(x->type         == GGML_TYPE_F32);
+    GGML_ASSERT(log_alpha->type == GGML_TYPE_F32);
+    GGML_ASSERT(log_beta->type  == GGML_TYPE_F32);
+    GGML_ASSERT(us_filter->type == GGML_TYPE_F32);
+    GGML_ASSERT(ds_filter->type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
+    result->op     = GGML_OP_AA_SNAKE_BETA;
+    result->src[0] = x;
+    result->src[1] = log_alpha;
+    result->src[2] = log_beta;
+    result->src[3] = us_filter;
+    result->src[4] = ds_filter;
+    return result;
+}
+
 // ggml_conv_2d
 
 // a: [OC，IC, KH, KW]
@@ -4582,12 +4717,23 @@ struct ggml_tensor * ggml_conv_2d(
         int                   p1,
         int                   d0,
         int                   d1) {
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, a->type); // [N, OH, OW, IC * KH * KW]
+    // CrispASR fork (issue #38 companion): pick im2col output type the
+    // same way ggml_conv_1d does. Upstream uses `a->type` unconditionally,
+    // forcing F16 when the kernel is F16 even if the input is F32; CPU
+    // MUL_MAT then sees F16 src0 + F16 src1 — unsupported under our
+    // vec_dot_type=F32 patch. Cast the kernel to F32 when im2col is F32
+    // so the resulting MUL_MAT has F32 src1. MUST RE-APPLY after every
+    // ggml bump.
+    const enum ggml_type im2col_type = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32) ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, im2col_type); // [N, OH, OW, IC * KH * KW]
+
+    struct ggml_tensor * a_mat = (im2col_type == GGML_TYPE_F32 && a->type != GGML_TYPE_F32) ?
+                                     ggml_cast(ctx, a, GGML_TYPE_F32) : a;
 
     struct ggml_tensor * result =
         ggml_mul_mat(ctx,
                 ggml_reshape_2d(ctx, im2col, im2col->ne[0],  im2col->ne[3] * im2col->ne[2] * im2col->ne[1]), // [N, OH, OW, IC * KH * KW] => [N*OH*OW, IC * KH * KW]
-                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1] * a->ne[2]),  a->ne[3]));                       // [OC，IC, KH, KW] => [OC, IC * KH * KW]
+                ggml_reshape_2d(ctx, a_mat, (a_mat->ne[0] * a_mat->ne[1] * a_mat->ne[2]),  a_mat->ne[3]));   // [OC, IC, KH, KW] => [OC, IC * KH * KW]
 
     result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], a->ne[3]); // [OC, N, OH, OW]
     result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2)); // [N, OC, OH, OW]
@@ -4711,14 +4857,22 @@ struct ggml_tensor * ggml_conv_2d_dw(
         int                   p1,
         int                   d0,
         int                   d1) {
+    // CrispASR fork (issue #38 companion): same im2col-type handling as
+    // ggml_conv_2d. Upstream hardcodes F16; CPU MUL_MAT can't pair F16
+    // src0 with F16 src1 under our vec_dot_type=F32 patch. Pick F32 when
+    // either side is F32 and cast the kernel to F32 to match. MUST RE-APPLY
+    // after every ggml bump.
+    const enum ggml_type im2col_type = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32) ? GGML_TYPE_F32 : GGML_TYPE_F16;
     struct ggml_tensor * new_a = ggml_reshape_4d(ctx, a, a->ne[0], a->ne[1], 1, a->ne[2] * a->ne[3]);
     struct ggml_tensor * im2col = ggml_im2col(ctx, new_a,
                                         ggml_reshape_4d(ctx, b, b->ne[0], b->ne[1], 1, b->ne[2] * b->ne[3]),
-                                        s0, s1, p0, p1, d0, d1, true, GGML_TYPE_F16); // [N * IC, OH, OW, KH * KW]
+                                        s0, s1, p0, p1, d0, d1, true, im2col_type); // [N * IC, OH, OW, KH * KW]
     struct ggml_tensor * new_b = ggml_reshape_4d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1], b->ne[2], b->ne[3]); // [N * IC, OH, OW, KH * KW] => [N, IC, OH * OW, KH * KW]
 
-    new_a = ggml_reshape_4d(ctx, new_a, (new_a->ne[0] * new_a->ne[1]), new_a->ne[2],  new_a->ne[3], 1);                       // [OC，1, KH, KW] => [1, OC, 1, KH * KW]
-    struct ggml_tensor * result = ggml_mul_mat(ctx, new_a, new_b);
+    new_a = ggml_reshape_4d(ctx, new_a, (new_a->ne[0] * new_a->ne[1]), new_a->ne[2],  new_a->ne[3], 1);                       // [OC, 1, KH, KW] => [1, OC, 1, KH * KW]
+    struct ggml_tensor * new_a_mat = (im2col_type == GGML_TYPE_F32 && new_a->type != GGML_TYPE_F32) ?
+                                         ggml_cast(ctx, new_a, GGML_TYPE_F32) : new_a;
+    struct ggml_tensor * result = ggml_mul_mat(ctx, new_a_mat, new_b);
     result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2], b->ne[2], b->ne[3]); // [N, OC, OH, OW]
 
     return result;

@@ -435,11 +435,26 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+// CrispASR ICB-feasibility probe (§210): split each graph_compute into the
+// host-side encode+commit time (what an MTLIndirectCommandBuffer replay would
+// collapse to a single encode) vs the GPU execute+sync time (which ICB cannot
+// remove). Gated by CRISPASR_METAL_PROFILE; when set, this forces a synchronous
+// waitUntilCompleted after the encode so the two halves are cleanly attributable
+// (it serializes the step — for measurement only, not a perf path).
+static int g_crisp_metal_prof = -1; // -1 unread, 0 off, 1 on
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
     }
+
+    if (g_crisp_metal_prof < 0) {
+        const char * e = getenv("CRISPASR_METAL_PROFILE");
+        g_crisp_metal_prof = (e && *e && *e != '0') ? 1 : 0;
+    }
+    const bool crisp_prof = g_crisp_metal_prof == 1;
+    const int64_t crisp_t0 = crisp_prof ? ggml_time_us() : 0;
 
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
@@ -548,6 +563,22 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        // CrispASR ICB-feasibility probe (§210): attribute host-encode vs GPU.
+        // crisp_t1 = all ops encoded + all command buffers committed (this is the
+        // host work an ICB replay collapses). crisp_t2 = GPU finished. The split
+        // tells us whether the ~100 ms/step decode floor is host re-encode (ICB
+        // would remove it) or GPU execute+submit (ICB cannot).
+        if (crisp_prof) {
+            const int64_t crisp_t1 = ggml_time_us();
+            if (ctx->cmd_buf_last) {
+                [ctx->cmd_buf_last waitUntilCompleted];
+            }
+            const int64_t crisp_t2 = ggml_time_us();
+            fprintf(stderr, "[metal-prof] nodes=%4d n_cb=%d encode_us=%6lld gpu_us=%6lld total_us=%6lld\n",
+                    gf->n_nodes, n_cb, (long long)(crisp_t1 - crisp_t0),
+                    (long long)(crisp_t2 - crisp_t1), (long long)(crisp_t2 - crisp_t0));
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -661,6 +692,14 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    // CrispASR debug (#83 r9 follow-up #5): override n_cb via env to test
+    // hypothesis that cross-cmd-buf concurrency violates mem_ranges tracking.
+    {
+        const char * env = getenv("CRISPASR_METAL_N_CB");
+        if (env && *env) {
+            n_cb = atoi(env);
+        }
+    }
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 

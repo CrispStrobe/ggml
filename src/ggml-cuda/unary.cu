@@ -351,6 +351,10 @@ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_op_unary_gated<op_gelu_quick>(ctx, dst);
 }
 
+void ggml_cuda_op_siglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_unary_gated<op_sigmoid>(ctx, dst);
+}
+
 // swiglu_oai
 
 template <typename T>
