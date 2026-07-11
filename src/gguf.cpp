@@ -508,6 +508,15 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
                 GGML_LOG_ERROR("%s: encountered bad_alloc error while reading key %" PRIi64 "\n", __func__, i);
                 ok = false;
             }
+            // A malformed GGUF with an empty key would otherwise reach the
+            // gguf_kv constructor's GGML_ASSERT(!key.empty()) and abort() the
+            // whole process (a DoS on any untrusted model load). Reject it here
+            // the same way a duplicate key is rejected, so the parser returns
+            // nullptr instead of crashing.
+            if (ok && key.empty()) {
+                GGML_LOG_ERROR("%s: encountered empty key at %" PRIi64 "\n", __func__, i);
+                ok = false;
+            }
             for (size_t j = 0; ok && j < ctx->kv.size(); ++j) {
                 if (key == ctx->kv[j].key) {
                     GGML_LOG_ERROR("%s: duplicate key '%s' for tensors %zu and %" PRIi64 " \n", __func__, key.c_str(), j, i);
