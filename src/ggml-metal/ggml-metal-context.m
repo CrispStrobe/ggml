@@ -441,7 +441,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 // remove). Gated by CRISPASR_METAL_PROFILE; when set, this forces a synchronous
 // waitUntilCompleted after the encode so the two halves are cleanly attributable
 // (it serializes the step — for measurement only, not a perf path).
-static int g_crisp_metal_prof = -1; // -1 unread, 0 off, 1 on
+static int g_crisp_metal_prof = -1; // -1 unread, 0 off, 1 whole-graph, 2 per-op
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
@@ -451,10 +451,103 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     if (g_crisp_metal_prof < 0) {
         const char * e = getenv("CRISPASR_METAL_PROFILE");
-        g_crisp_metal_prof = (e && *e && *e != '0') ? 1 : 0;
+        if (!e || !*e || *e == '0') g_crisp_metal_prof = 0;
+        else if (e[0] == '2')       g_crisp_metal_prof = 2; // per-op breakdown
+        else                        g_crisp_metal_prof = 1; // whole-graph host/gpu split
     }
     const bool crisp_prof = g_crisp_metal_prof == 1;
     const int64_t crisp_t0 = crisp_prof ? ggml_time_us() : 0;
+
+    // CrispASR §3 per-op GPU profiler (measurement-only, CRISPASR_METAL_PROFILE=2).
+    // Execute the graph one node per command buffer, in topological order — this
+    // preserves data flow and gallocr aliasing exactly like the normal sequential
+    // run, so the final output is correct — and attribute each node's
+    // (GPUEndTime - GPUStartTime) to its GGML_OP. Serialized: absolute times inflate
+    // vs the async multi-cb path, but the per-op-TYPE breakdown is the signal we want
+    // (localizes where the melotts HiFi-GAN 37x-off-roofline GPU time actually lives).
+    if (g_crisp_metal_prof == 2) {
+        ggml_metal_device_rsets_keep_alive(ctx->dev);
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        double  op_us [GGML_OP_COUNT];
+        int64_t op_cnt[GGML_OP_COUNT];
+        for (int i = 0; i < GGML_OP_COUNT; ++i) { op_us[i] = 0.0; op_cnt[i] = 0; }
+        double total_us = 0.0;
+        ctx->gf = gf;
+
+        // Measure the empty-command-buffer scheduling floor: each timed op rides this
+        // fixed per-buffer GPU-queue latency (large under contention), so real kernel
+        // time ~= measured - floor. Median of 21 empty commits.
+        double floor_samp[21];
+        for (int i = 0; i < 21; ++i) {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                [cb retain];
+                [cb commit];
+                [cb waitUntilCompleted];
+                double dt = (cb.GPUEndTime - cb.GPUStartTime) * 1e6;
+                floor_samp[i] = dt < 0.0 ? 0.0 : dt;
+                [cb release];
+            }
+        }
+        for (int i = 0; i < 21; ++i) for (int j = i + 1; j < 21; ++j)
+            if (floor_samp[j] < floor_samp[i]) { double t = floor_samp[i]; floor_samp[i] = floor_samp[j]; floor_samp[j] = t; }
+        const double floor_us = floor_samp[10];
+
+        const int64_t t0 = ggml_time_us();
+        // Init the op-encoder over the FULL remaining range [cur, n_nodes) each step so
+        // any residual (structural) fusion is tolerated: encode one op-group, then
+        // advance by however many nodes it consumed (res). A tight [cur,cur+1) range
+        // trips the ggml-metal-ops fusion guard when an op fuses its successor.
+        int cur = 0;
+        while (cur < gf->n_nodes) {
+            struct ggml_tensor * node = gf->nodes[cur];
+            // Skip pure-metadata no-ops: they encode no kernel, so timing them only
+            // captures scheduling-latency noise (they polluted the first run at 40%+).
+            if (node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
+                node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE ||
+                node->op == GGML_OP_TRANSPOSE) { cur += 1; continue; }
+            int res = 1;
+            @autoreleasepool {
+                id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+                [cmd_buf retain];
+                ggml_metal_op_t op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, cur, gf->n_nodes,
+                                                        /*use_fusion=*/false, /*use_concurrency=*/false,
+                                                        /*use_capture=*/false, /*debug_graph=*/0, /*debug_fusion=*/0);
+                res = ggml_metal_op_encode(op, 0);
+                ggml_metal_op_free(op);
+                if (res <= 0) res = 1;
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+                if (cmd_buf.status == MTLCommandBufferStatusCompleted) {
+                    double dt = (cmd_buf.GPUEndTime - cmd_buf.GPUStartTime) * 1e6;
+                    if (dt < 0.0) dt = 0.0;
+                    op_us[node->op]  += dt;
+                    op_cnt[node->op] += 1;
+                    total_us         += dt;
+                }
+                [cmd_buf release];
+            }
+            cur += res;
+        }
+        const int64_t t1 = ggml_time_us();
+        // Floor-subtracted totals: net_us[i] = op_us[i] - floor*cnt (real kernel time).
+        double net_total = 0.0;
+        double net_us[GGML_OP_COUNT];
+        for (int i = 0; i < GGML_OP_COUNT; ++i) {
+            net_us[i] = op_us[i] - floor_us * (double) op_cnt[i];
+            if (net_us[i] < 0.0) net_us[i] = 0.0;
+            net_total += net_us[i];
+        }
+        fprintf(stderr, "[metal-perop] nodes=%d sum_gpu_us=%.0f net_gpu_us=%.0f floor_us/buf=%.0f wall_us=%lld\n",
+                gf->n_nodes, total_us, net_total, floor_us, (long long)(t1 - t0));
+        for (int i = 0; i < GGML_OP_COUNT; ++i) {
+            if (op_cnt[i] == 0) continue;
+            fprintf(stderr, "[metal-perop]   %-18s cnt=%5lld raw_us=%11.0f net_us=%11.0f (net %5.1f%%) net_avg=%8.1f\n",
+                    ggml_op_name((enum ggml_op) i), (long long) op_cnt[i], op_us[i], net_us[i],
+                    100.0 * net_us[i] / (net_total > 0.0 ? net_total : 1.0), net_us[i] / (double) op_cnt[i]);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
 
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
