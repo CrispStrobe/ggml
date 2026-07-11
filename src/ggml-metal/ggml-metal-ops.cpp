@@ -3898,13 +3898,35 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
         /*.KH   =*/ KH,
         /*.KW   =*/ KW,
         /*.KHW  =*/ KH * KW,
+        /*.OW   =*/ OW,
+        /*.occ  =*/ 0,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_im2col(lib, op);
 
     GGML_ASSERT(KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
-    const uint64_t ntptg0 = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/(KH*KW), N);
+    // CrispASR fork (batch-1 occupancy). occ path fills the threadgroup with a block
+    // of OW columns (× KH×KW) instead of sizing thread-dim0 from N (upstream ntptg0
+    // = 1 at inference N=1 → only KH*KW threads/tg → im2col ~40x below BW, measured
+    // 58% of melotts HiFi-GAN GPU time). Bit-exact reorg (copy, each dst written once
+    // — validated: moonshine ASR occ-on == occ-off byte-for-byte; melotts ASR
+    // round-trip valid), ~2x on batch-1 conv (hifigan gpu 1.88s→0.83s).
+    // Default: AUTO — enabled for N==1 (the degenerate inference case; strictly
+    // better, cannot regress N>1 which keeps the upstream path). Override with
+    // CRISPASR_METAL_IM2COL_OCC=1 (force on) / =0 (force off, upstream).
+    static int s_occ_env = -2; // -2 unread, -1 auto, 0 force-off, 1 force-on
+    if (s_occ_env == -2) {
+        const char * e = std::getenv("CRISPASR_METAL_IM2COL_OCC");
+        s_occ_env = !e ? -1 : ((*e && *e != '0') ? 1 : 0);
+    }
+    const int use_occ = (s_occ_env == -1) ? (N == 1 ? 1 : 0) : s_occ_env;
+    args.occ = use_occ;
+
+    const uint64_t max_t     = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
+    const uint64_t ntptg0    = std::min<uint64_t>(max_t/(KH*KW), (uint64_t) N); // upstream
+    const uint64_t ow_per_tg = std::min<uint64_t>(std::max<uint64_t>(1, max_t/(KH*KW)), (uint64_t) OW);
+    const uint64_t ow_blocks = ((uint64_t) OW + ow_per_tg - 1)/ow_per_tg;
 
     // CrispASR debug (#83 r9 follow-up #5): host-side readback of op->src[1]
     // for the FIRST UNet im2col call (signature IC==320, KH==1, KW==3).
@@ -3946,7 +3968,11 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, IC, OH, OW, ntptg0, KH, KW);
+    if (use_occ) {
+        ggml_metal_encoder_dispatch_threadgroups(enc, IC, OH, ow_blocks, ow_per_tg, KH, KW);
+    } else {
+        ggml_metal_encoder_dispatch_threadgroups(enc, IC, OH, OW, ntptg0, KH, KW);
+    }
 
     return 1;
 }

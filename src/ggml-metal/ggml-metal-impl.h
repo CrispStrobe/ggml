@@ -754,6 +754,11 @@ typedef struct {
     int32_t  KH;
     int32_t  KW;
     int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
+    int32_t  OW;  // CrispASR fork: explicit OW (grid z-dim blocks OW in occ mode).
+    int32_t  occ; // CrispASR fork: 1 = batch-1 occupancy path (OW-blocked threads,
+                  // ~2x on batch-1 conv, bit-exact), 0 = original (thread-dim0 = N).
+                  // Gated CRISPASR_METAL_IM2COL_OCC, default 0. See kernel_im2col
+                  // note. MUST RE-APPLY after ggml bump.
 } ggml_metal_kargs_im2col;
 
 typedef struct {

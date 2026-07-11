@@ -4706,6 +4706,16 @@ typedef void (im2col_t)(
         uint3   ntg[[threads_per_threadgroup]]);
 
 template <typename T>
+// CrispASR fork: batch-1 occupancy path (args.occ==1, gated by
+// CRISPASR_METAL_IM2COL_OCC=1, default OFF). Upstream sizes thread-dim0 from N
+// (ntptg0 = min(max/(KH*KW), N)), so at inference batch N=1 every threadgroup runs
+// only KH*KW (=3..11) threads → ~10-34% of one simdgroup → im2col ~40x below BW
+// (measured 58% of melotts HiFi-GAN GPU time). The occ path blocks OW across
+// thread-dim0 (grid z = ceil(OW/OW_PER_TG), threads = OW_PER_TG*KH*KW), N looped
+// inside — a bit-exact reorganization of the same copy (each dst element written
+// once with the same value, no FP reorder). Measured ~2x on melotts HiFi-GAN
+// (gpu 1.88s→0.83s), ASR-roundtrip validated. args.occ==0 is the upstream path,
+// unchanged (kept for A/B). MUST RE-APPLY after ggml bump.
 kernel void kernel_im2col(
         constant ggml_metal_kargs_im2col & args,
         device const float * x,
@@ -4714,19 +4724,45 @@ kernel void kernel_im2col(
         uint3  tgpg[[threadgroups_per_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-//    const int64_t IC = tgpg[0];
     const int64_t OH = tgpg[1];
-    const int64_t OW = tgpg[2];
 
     const int64_t KH = ntg[1];
     const int64_t KW = ntg[2];
 
-          int64_t in  = tpitg[0];
     const int64_t ikh = tpitg[1];
     const int64_t ikw = tpitg[2];
 
     const int64_t iic = tgpig[0];
     const int64_t ioh = tgpig[1];
+
+    if (args.occ) {
+        // batch-1 occupancy path (experimental, default OFF)
+        const int64_t OW  = args.OW;
+        const int64_t iow = (int64_t) tgpig[2]*ntg[0] + tpitg[0];
+        if (iow >= OW) {
+            return; // tail of the last OW block
+        }
+        const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
+        const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
+        device T * pdst = (device T *) (dst);
+        const int64_t dst_col = iic*(KH*KW) + ikh*KW + ikw;
+        const bool oob = (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW);
+        for (int64_t in = 0; in < args.N; ++in) {
+            const int64_t offset_dst = (in*OH*OW + ioh*OW + iow)*args.CHW + dst_col;
+            if (oob) {
+                pdst[offset_dst] = 0.0f;
+            } else {
+                const int64_t offset_src = in*args.ofs0 + iic*args.ofs1 + iih*args.IW + iiw;
+                pdst[offset_dst] = x[offset_src];
+            }
+        }
+        return;
+    }
+
+    // ── upstream path (args.occ==0), unchanged ──
+    const int64_t OW = tgpg[2];
+
+          int64_t in  = tpitg[0];
     const int64_t iow = tgpig[2];
 
     const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
