@@ -4604,22 +4604,51 @@ struct ggml_tensor * ggml_conv_1d_dw(
         int                   s0,
         int                   p0,
         int                   d0) {
-    struct ggml_tensor * new_b = ggml_reshape_4d(ctx, b, b->ne[0], 1, b->ne[1], b->ne[2]);
-
     // CrispASR fork (issue #38 companion): same im2col-type handling as
     // ggml_conv_1d. ggml_compute_forward_mul_mat requires src1 to be F32
     // when conversion is needed; cast weight to F32 when im2col is F32 and
     // weight is a non-F32 float type. MUST RE-APPLY after every ggml bump.
     const enum ggml_type im2col_type = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32) ? GGML_TYPE_F32 : GGML_TYPE_F16;
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, im2col_type);
 
     struct ggml_tensor * a_mat = (im2col_type == GGML_TYPE_F32 && a->type != GGML_TYPE_F32)
                                      ? ggml_cast(ctx, a, GGML_TYPE_F32) : a;
-    struct ggml_tensor * result = ggml_mul_mat(ctx, im2col, a_mat);
 
-    result = ggml_reshape_3d(ctx, result, result->ne[0], result->ne[2], 1);
+    // CrispASR fork: support batch N > 1. MUST RE-APPLY after every ggml bump.
+    //
+    // The original body reshapes b [T, C, N] to [T, 1, C, N] and hands that to
+    // the 1-D im2col path, whose GGML_ASSERT(b->ne[3] == 1) then fires for any
+    // N > 1 -- so batched depthwise conv ABORTED rather than miscomputing (a
+    // safe failure, but an unsupported one). The trailing
+    // ggml_reshape_3d(..., result->ne[2], 1) also hardcodes 1 into ne[2],
+    // dropping the batch dim.
+    //
+    // Fold the batch into the channel axis instead: b -> [T, 1, C*N, 1], where
+    // the flattened index is cn = n*C + ch (reshape preserves flat order). The
+    // per-channel kernel is tiled to match with ggml_repeat -- element cn reads
+    // kernel (cn mod C) = ch, which is exactly repeat's tiling semantics. The
+    // mul_mat result [OL, 1, C*N] has flat cn*OL + ol = n*C*OL + ch*OL + ol,
+    // which is bit-for-bit the [OL, C, N] layout, so the final reshape is free.
+    //
+    // N == 1 keeps the original path unchanged.
+    const int64_t C = b->ne[1];
+    const int64_t N = b->ne[2];
 
-    return result;
+    if (N == 1) {
+        struct ggml_tensor * new_b = ggml_reshape_4d(ctx, b, b->ne[0], 1, C, N);
+        struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, im2col_type);
+        struct ggml_tensor * result = ggml_mul_mat(ctx, im2col, a_mat);
+        return ggml_reshape_3d(ctx, result, result->ne[0], result->ne[2], 1);
+    }
+
+    struct ggml_tensor * new_b = ggml_reshape_4d(ctx, b, b->ne[0], 1, C*N, 1);
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, im2col_type);
+
+    struct ggml_tensor * a_rep = ggml_repeat(ctx, a_mat,
+            ggml_new_tensor_3d(ctx, a_mat->type, a_mat->ne[0], a_mat->ne[1], C*N));
+
+    struct ggml_tensor * result = ggml_mul_mat(ctx, im2col, a_rep); // [OL, 1, C*N]
+
+    return ggml_reshape_3d(ctx, result, result->ne[0], C, N);       // [OL, C, N]
 }
 
 // ggml_conv_1d_dw_ph
