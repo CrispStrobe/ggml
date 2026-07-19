@@ -4548,7 +4548,38 @@ struct ggml_tensor * ggml_conv_1d(
                 ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])), // [N, OL, IC * K] => [N*OL, IC * K]
                 ggml_reshape_2d(ctx, a_mat, (a_mat->ne[0] * a_mat->ne[1]), a_mat->ne[2]));    // [OC, IC, K] => [OC, IC * K]
 
-    result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
+    // CrispASR fork: fix the batch (N > 1) reshape. MUST RE-APPLY after a bump.
+    //
+    // `result` above is mul_mat(a=col[IC*K, N*OL], b=w[IC*K, OC]), so its ne is
+    // [N*OL, OC] — i.e. OC is the SLOWEST axis, flat = oc*(N*OL) + n*OL + ol.
+    // The old one-step reshape to [OL, OC, N] instead claims N is slowest
+    // (flat = n*OL*OC + oc*OL + ol). Those two expressions are identical when
+    // N == 1 and differ otherwise, which is why every existing caller was
+    // correct and the batch path was silently wrong. Verified: N=1 cos=1.0,
+    // N=2 cos=0.41, N=3 cos=0.06 against a hand-rolled conv reference.
+    //
+    // Reshape to the TRUE layout [OL, N, OC], then permute to [OL, OC, N].
+    // N == 1 keeps the old zero-copy path (the permute would be a no-op).
+    //
+    // Compatibility, audited across CrispASR (141 call sites incl. the
+    // ggml_conv_1d_ph forwarders) and CrispEmbed (zero callers):
+    //   * 136 sites pass N == 1 and take the unchanged branch.
+    //   * 2 sites DO pass N > 1 (indextts_voc.cpp aa_snake_beta_native, which
+    //     maps CHANNELS onto the batch axis to run a depthwise FIR across all
+    //     of them at once). They are unaffected because their filter is
+    //     [K,1,1], i.e. OC == 1 -- and with OC == 1 both branches produce the
+    //     identical flat layout n*OL+ol AND the identical declared ne. Verified
+    //     empirically on that exact shape class, N = 1..4.
+    //   * Neither batched site compensates for the old transpose, so nothing
+    //     depended on the broken layout.
+    // The two branches therefore diverge only when N > 1 AND OC > 1, which no
+    // caller in either repo currently does.
+    if (im2col->ne[2] == 1) {
+        result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [OL, OC, 1]
+    } else {
+        result = ggml_reshape_3d(ctx, result, im2col->ne[1], im2col->ne[2], a->ne[2]); // [OL, N, OC]
+        result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));                // [OL, OC, N]
+    }
 
     return result;
 }
