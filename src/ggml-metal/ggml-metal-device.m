@@ -686,8 +686,29 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
         return;
     }
 
-    // note: if you hit this assert, most likely you haven't deallocated all Metal resources before exiting
-    GGML_ASSERT([rsets->data count] == 0);
+    // CrispASR patch: warn instead of abort when resources outlive teardown.
+    //
+    // Upstream asserts here because a non-empty residency set means a buffer
+    // was not freed before the device went away. That is a fair diagnostic for
+    // an application, but this is a LIBRARY: ggml_metal_device_get holds the
+    // device in a function-local static, so this runs during static
+    // destruction, and any FFI consumer that keeps a session alive until
+    // process exit -- an entirely normal pattern for a long-lived Dart/Python
+    // handle -- got SIGABRT plus a backtrace AFTER all its output was already
+    // correct. Reported by a downstream consumer against v0.8.17.
+    //
+    // Releasing the array is still correct refcounting: any residency set a
+    // live buffer still references stays alive by its own retain. So warn,
+    // then proceed. Same posture as 1dc4cb93 (gguf: reject empty keys instead
+    // of asserting) -- a malformed/late state should degrade, not abort a
+    // process that has already done its work.
+    const NSUInteger n_alive = [rsets->data count];
+    if (n_alive != 0) {
+        GGML_LOG_WARN("%s: %lu Metal residency set(s) still alive at device teardown - "
+                      "a buffer or context was not freed before exit. Continuing; "
+                      "free your contexts/sessions explicitly to silence this.\n",
+                      __func__, (unsigned long) n_alive);
+    }
 
     atomic_store_explicit(&rsets->d_stop, true, memory_order_relaxed);
 
