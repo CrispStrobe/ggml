@@ -79,8 +79,11 @@ jobs:
       - name: install deps
         run: |
           sudo apt-get update
+          # spirv-headers is required by src/ggml-vulkan/CMakeLists.txt's
+          # find_package(SPIRV-Headers CONFIG REQUIRED) — libvulkan-dev alone
+          # satisfies find_package(Vulkan) but not that.
           sudo apt-get install -y cmake ninja-build glslc libvulkan-dev \
-                                  vulkan-tools mesa-vulkan-drivers
+                                  spirv-headers vulkan-tools mesa-vulkan-drivers
       - name: build
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON

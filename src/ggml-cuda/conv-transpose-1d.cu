@@ -34,7 +34,11 @@ static __global__ void conv_transpose_1d_kernel(
                 continue;
             }
 
-            accumulator += src0[kernel_offset + k] * src1[input_offset + input_t];
+            // CrispASR patch (upstream-prs 14: F16 kernel weights) — MUST RE-APPLY
+            // after every ggml bump. src0_t is float OR half; `half * float` is
+            // ambiguous to nvcc ("more than one operator * matches"), so widen the
+            // weight explicitly rather than relying on an implicit conversion.
+            accumulator += ggml_cuda_cast<float>(src0[kernel_offset + k]) * src1[input_offset + input_t];
         }
     }
     dst[global_index] = accumulator;

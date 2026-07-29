@@ -84,12 +84,19 @@ static float dot_product(const float * a1, const float * a2, size_t test_size) {
 
 // Total dot product error
 static float dot_product_error(const ggml_type_traits * qfns, const ggml_type_traits_cpu * qfns_cpu, size_t test_size, const float * test_data1, const float * test_data2) {
-    GGML_UNUSED(qfns);
+    const auto * vdot      = ggml_get_type_traits_cpu(qfns_cpu->vec_dot_type);
+    const auto * vdot_base = ggml_get_type_traits(qfns_cpu->vec_dot_type);
 
-    std::vector<uint8_t> tmp_q1(2*test_size);
-    std::vector<uint8_t> tmp_q2(2*test_size);
-
-    const auto * vdot = ggml_get_type_traits_cpu(qfns_cpu->vec_dot_type);
+    // CrispASR patch (issue #38) — MUST RE-APPLY after every ggml bump.
+    // Upstream sizes both scratch buffers 2*test_size bytes, which silently
+    // assumes no vec_dot_type is wider than 2 bytes per element. Our type traits
+    // set [GGML_TYPE_F16].vec_dot_type = GGML_TYPE_F32, so vdot->from_float
+    // writes 4 bytes per element and overruns tmp_q2 by test_size bytes.
+    // glibc catches it ("double free or corruption"); macOS malloc does not,
+    // which is why this stayed invisible until the fork got CI.
+    // Size both buffers from the actual types instead of guessing.
+    std::vector<uint8_t> tmp_q1((size_t) qfns->type_size      * test_size / qfns->blck_size);
+    std::vector<uint8_t> tmp_q2((size_t) vdot_base->type_size * test_size / vdot_base->blck_size);
 
     qfns_cpu->from_float(test_data1, tmp_q1.data(), test_size);
     vdot->from_float(test_data2, tmp_q2.data(), test_size);
