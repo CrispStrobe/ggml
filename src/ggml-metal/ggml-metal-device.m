@@ -880,6 +880,8 @@ static void crispasr_metal_pipeline_cache_flush(ggml_metal_device_t dev) {
                 [[dev->binary_archive_url path] UTF8String],
                 err ? [[err description] UTF8String] : "unknown");
     }
+}
+
 static enum ggml_metal_device_id ggml_metal_device_id_parse(const char * name) {
     if (!name) {
         return GGML_METAL_DEVICE_GENERIC;
@@ -1438,9 +1440,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_REPEAT:
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;
-        // CrispASR patch (PR #160 col2im_1d) — MUST RE-APPLY after ggml bump.
-        case GGML_OP_COL2IM_1D:
-            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
         // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
         case GGML_OP_AA_SNAKE_BETA:
             return op->src[0]->type == GGML_TYPE_F32 &&

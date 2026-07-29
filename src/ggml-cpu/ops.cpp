@@ -6561,76 +6561,6 @@ void ggml_compute_forward_conv_transpose_1d(
     }
 }
 
-// ggml_compute_forward_col2im_1d
-//
-// Gather-based col2im: each output position (t_out, oc) loops over its
-// contributing input columns and sums the pre-computed (oc, k) entries.
-// Matches the CUDA kernel in col2im-1d.cu bit-for-bit so GPU/CPU results
-// are interchangeable.
-static void ggml_compute_forward_col2im_1d_f32(
-        const ggml_compute_params * params,
-              ggml_tensor * dst) {
-
-    const ggml_tensor * col = dst->src[0];
-
-    GGML_ASSERT(col->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-
-    const int32_t s0 = ((const int32_t *)(dst->op_params))[0];
-    const int32_t OC = ((const int32_t *)(dst->op_params))[1];
-    const int32_t p0 = ((const int32_t *)(dst->op_params))[2];
-
-    const int K_OC  = (int)col->ne[0];
-    const int T_in  = (int)col->ne[1];
-    const int K     = K_OC / OC;
-    const int T_out = (int)dst->ne[0];
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    const int total = T_out * OC;
-    const int dr  = (total + nth - 1) / nth;
-    const int ir0 = dr * ith;
-    const int ir1 = ir0 + dr < total ? ir0 + dr : total;
-
-    if (ir0 >= ir1) return;
-
-    const float * GGML_RESTRICT cp = (const float *)col->data;
-    float       * GGML_RESTRICT dp = (float       *)dst->data;
-
-    for (int gidx = ir0; gidx < ir1; gidx++) {
-        const int t_out = gidx % T_out;
-        const int oc    = gidx / T_out;
-        const int t_abs = t_out + p0;
-
-        int t_in_min = (t_abs - K + s0) / s0;
-        if (t_in_min < 0) t_in_min = 0;
-        int t_in_max = t_abs / s0;
-        if (t_in_max >= T_in) t_in_max = T_in - 1;
-
-        float sum = 0.0f;
-        for (int t_in = t_in_min; t_in <= t_in_max; t_in++) {
-            const int j = t_abs - t_in * s0;
-            sum += cp[(oc * K + j) + t_in * K_OC];
-        }
-        dp[gidx] = sum;
-    }
-}
-
-void ggml_compute_forward_col2im_1d(
-        const ggml_compute_params * params,
-              ggml_tensor * dst) {
-
-    const ggml_tensor * col = dst->src[0];
-
-    switch (col->type) {
-        case GGML_TYPE_F32:
-            ggml_compute_forward_col2im_1d_f32(params, dst);
-            break;
-        default:
-            GGML_ABORT("col2im_1d: unsupported type");
-    }
-}
 
 // ggml_compute_forward_aa_snake_beta
 //
@@ -7266,14 +7196,26 @@ void ggml_compute_forward_im2col_3d(
 static void ggml_call_mul_mat(ggml_type type, const ggml_compute_params * params, int64_t m, int64_t n, int64_t k,
                               void * a, void * b, float * c) {
     const ggml_type_traits * traits = ggml_get_type_traits(type);
+
+    // CrispASR patch (issue #38) — MUST RE-APPLY after every ggml bump.
+    // `a` is the im2col patch buffer and becomes mul_mat's src1, so it is built in
+    // `type`'s vec_dot_type rather than in `type` itself. Upstream the two coincide
+    // (F16->F16, F32->F32) so this is a no-op there; our F16 traits use
+    // vec_dot_type=F32 + ggml_vec_dot_f16_f32 to dodge the saturating F32->F16 cast,
+    // and typing src1 F16 here would trip mul_mat's
+    // GGML_ASSERT(src1->type == GGML_TYPE_F32) conversion branch.
+    // Callers MUST fill `a` in this same type (see conv_2d/conv_3d impls).
+    const ggml_type          src1_type   = ggml_get_type_traits_cpu(type)->vec_dot_type;
+    const ggml_type_traits * src1_traits = ggml_get_type_traits(src1_type);
+
     struct ggml_tensor src1 = {};
-    src1.type  = type;
+    src1.type  = src1_type;
     src1.ne[0] = k;
     src1.ne[1] = m;
     src1.ne[2] = 1;
     src1.ne[3] = 1;
-    src1.nb[0] = traits->type_size;
-    src1.nb[1] = k * traits->type_size;
+    src1.nb[0] = src1_traits->type_size;
+    src1.nb[1] = k * src1_traits->type_size;
     src1.nb[2] = src1.nb[1];
     src1.nb[3] = src1.nb[2];
     src1.data  = a;
@@ -7395,7 +7337,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
     GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
     GGML_ASSERT(kernel->type == kernel_type);
 
-    const ggml_type_traits * traits = ggml_get_type_traits(kernel_type);
+    // CrispASR patch (issue #38) — MUST RE-APPLY after every ggml bump.
+    // The im2col patch buffer is mul_mat's src1, so it must be built in the kernel
+    // type's vec_dot_type. Identical to upstream when they coincide; under our F16
+    // traits (vec_dot_type=F32) it also keeps the patches out of F16, which is the
+    // saturation #38 exists to avoid. Same idiom as flash-attn above.
+    const ggml_type          patch_type = ggml_get_type_traits_cpu(kernel_type)->vec_dot_type;
+    const ggml_type_traits * traits     = ggml_get_type_traits(patch_type);
 
     const int32_t stride_x   = dst->op_params[0];
     const int32_t stride_y   = dst->op_params[1];
@@ -7468,10 +7416,12 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
                         }
 
                         char * element_ptr = dst_row + dst_idx * traits->type_size;
-                        if (kernel_type == GGML_TYPE_F32) {
+                        if (patch_type == GGML_TYPE_F32) {
                             *(float *) element_ptr = src_val;
-                        } else if (kernel_type == GGML_TYPE_F16) {
+                        } else if (patch_type == GGML_TYPE_F16) {
                             *(ggml_fp16_t *) element_ptr = GGML_CPU_FP32_TO_FP16(src_val);
+                        } else {
+                            GGML_ABORT("conv_2d: unsupported patch type %s", ggml_type_name(patch_type));
                         }
                     }
                 }
@@ -7532,7 +7482,10 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
     GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
     GGML_ASSERT(kernel->type == kernel_type);
 
-    const ggml_type_traits * traits = ggml_get_type_traits(kernel_type);
+    // CrispASR patch (issue #38) — see ggml_compute_forward_conv_2d_impl above.
+    // MUST RE-APPLY after every ggml bump.
+    const ggml_type          patch_type = ggml_get_type_traits_cpu(kernel_type)->vec_dot_type;
+    const ggml_type_traits * traits     = ggml_get_type_traits(patch_type);
 
     const int32_t s0 = dst->op_params[0];
     const int32_t s1 = dst->op_params[1];
@@ -7613,10 +7566,12 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
                             }
 
                             char * element_ptr = dst_row + dst_idx * traits->type_size;
-                            if (kernel_type == GGML_TYPE_F32) {
+                            if (patch_type == GGML_TYPE_F32) {
                                 *(float *)element_ptr = src_val;
-                            } else if (kernel_type == GGML_TYPE_F16) {
+                            } else if (patch_type == GGML_TYPE_F16) {
                                 *(ggml_fp16_t *)element_ptr = GGML_CPU_FP32_TO_FP16(src_val);
+                            } else {
+                                GGML_ABORT("conv_3d: unsupported patch type %s", ggml_type_name(patch_type));
                             }
                         }
                     }
