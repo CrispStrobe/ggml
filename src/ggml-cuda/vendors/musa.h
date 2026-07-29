@@ -32,6 +32,8 @@
 #define cublasSetMathMode mublasSetMathMode
 #define cublasSetStream mublasSetStream
 #define cublasSgemm mublasSgemm
+#define cublasSgemmBatched mublasSgemmBatched
+#define cublasSgemmStridedBatched mublasSgemmStridedBatched
 #define cublasStatus_t mublasStatus_t
 #define cublasOperation_t mublasOperation_t
 #define cublasGetStatusString mublasGetStatusString
@@ -39,6 +41,7 @@
 #define cudaDeviceCanAccessPeer musaDeviceCanAccessPeer
 #define cudaDeviceDisablePeerAccess musaDeviceDisablePeerAccess
 #define cudaDeviceEnablePeerAccess musaDeviceEnablePeerAccess
+#define cudaDeviceGetPCIBusId musaDeviceGetPCIBusId
 #define cudaDeviceProp musaDeviceProp
 #define cudaDeviceSynchronize musaDeviceSynchronize
 #define cudaError_t musaError_t
