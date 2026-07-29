@@ -961,7 +961,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_conv_transpose_1d_f32;
     vk_pipeline pipeline_conv_transpose_1d_f16;
     vk_pipeline pipeline_col2im_1d_f32;
-    vk_pipeline pipeline_col2im_1d_f32;
     vk_pipeline pipeline_col2im_1d_f16;
     vk_pipeline pipeline_col2im_1d_bf16;
     vk_pipeline pipeline_out_prod_f32;
@@ -1642,15 +1641,6 @@ struct vk_op_conv_transpose_1d_push_constants {
     int32_t s0;
 };
 
-struct vk_op_col2im_1d_push_constants {
-    uint32_t T_in;
-    uint32_t T_out;
-    uint32_t OC;
-    uint32_t K;
-    uint32_t K_OC;
-    int32_t  s0;
-    int32_t  p0;
-    uint32_t total;
 struct vk_op_snake_push_constants {
     uint32_t ne0;
     uint32_t ne1;
@@ -5517,7 +5507,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_conv_transpose_1d_f32, "conv_transpose_1d_f32", conv_transpose_1d_f32_len, conv_transpose_1d_f32_data, "main", 3, sizeof(vk_op_conv_transpose_1d_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_conv_transpose_1d_f16, "conv_transpose_1d_f16", conv_transpose_1d_f16_len, conv_transpose_1d_f16_data, "main", 3, sizeof(vk_op_conv_transpose_1d_push_constants), {1, 1, 1}, {}, 1);
 
-    ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f32, "col2im_1d_f32", col2im_1d_f32_len, col2im_1d_f32_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f32,  "col2im_1d_f32",  col2im_1d_f32_len,  col2im_1d_f32_data,  "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f16,  "col2im_1d_f16",  col2im_1d_f16_len,  col2im_1d_f16_data,  "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_bf16, "col2im_1d_bf16", col2im_1d_bf16_len, col2im_1d_bf16_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
@@ -15164,10 +15153,6 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_CONV_TRANSPOSE_1D:
         ggml_vk_conv_transpose_1d(ctx, compute_ctx, src0, src1, node);
-
-        break;
-    case GGML_OP_COL2IM_1D:
-        ggml_vk_col2im_1d(ctx, compute_ctx, src0, node);
 
         break;
     case GGML_OP_POOL_2D:
