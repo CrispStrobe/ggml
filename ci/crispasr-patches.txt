@@ -52,3 +52,8 @@
 1	src/ggml-cuda/im2col.cu	CrispASR patch
 1	src/ggml-cuda/norm.cu	CrispASR patch
 1	src/ggml-cuda/ggml-cuda.cu	CrispASR patch
+
+# --- CUDA build robustness -------------------------------------------------
+# Upstream links the CUDA::cuda_driver imported target unconditionally for the
+# VMM pool; it is not always defined (Kaggle, nvidia/cuda devel containers).
+1	src/ggml-cuda/CMakeLists.txt	GGML_CUDA_DRIVER_LIB

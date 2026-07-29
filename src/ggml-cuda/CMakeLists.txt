@@ -180,10 +180,35 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
     endif()
 
+    # CrispASR patch — MUST RE-APPLY after every ggml bump.
+    #
+    # The VMM pool calls the CUDA *driver* API (cuMemCreate, cuMemMap, ...), so
+    # it needs libcuda.so. Upstream links the CUDA::cuda_driver imported target
+    # unconditionally, but FindCUDAToolkit does not always define it — notably on
+    # Kaggle (configure fails outright: "Target ggml-cuda links to CUDA::cuda_driver
+    # but the target was not found") and inside nvidia/cuda devel containers,
+    # which ship only the stub. Both are environments we build in.
+    #
+    # Degrade gracefully instead of failing: prefer the imported target, then the
+    # driver library (including the stub, which is link-time sufficient), and only
+    # as a last resort disable VMM so the build still succeeds.
     if (GGML_CUDA_NO_VMM)
         # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
-    else()
+    elseif (TARGET CUDA::cuda_driver)
         target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
+    else()
+        find_library(GGML_CUDA_DRIVER_LIB NAMES cuda
+                     HINTS ${CUDAToolkit_LIBRARY_DIR}
+                           ${CUDAToolkit_LIBRARY_ROOT}/lib64
+                           /usr/local/cuda/lib64
+                     PATH_SUFFIXES stubs)
+        if (GGML_CUDA_DRIVER_LIB)
+            message(STATUS "CUDA::cuda_driver not exported; linking ${GGML_CUDA_DRIVER_LIB}")
+            target_link_libraries(ggml-cuda PRIVATE ${GGML_CUDA_DRIVER_LIB})
+        else()
+            message(WARNING "libcuda not found — building with GGML_CUDA_NO_VMM")
+            target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_NO_VMM)
+        endif()
     endif()
 
     if (GGML_CUDA_NCCL)

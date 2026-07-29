@@ -108,6 +108,9 @@ jobs:
       - uses: actions/checkout@v4
       # No GPU on hosted runners, so this is a compile check — which is exactly
       # what catches the merge-duplicate class of breakage.
+      # No linker flags on purpose: a devel container has only the libcuda stub,
+      # which is exactly the case src/ggml-cuda/CMakeLists.txt now handles. Adding
+      # -L stubs here would paper over that and stop testing the real path.
       - name: build
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
