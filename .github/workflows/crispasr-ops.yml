@@ -105,12 +105,21 @@ jobs:
         run: |
           apt-get update
           apt-get install -y cmake ninja-build git build-essential
+      # A devel container ships only the libcuda STUB, whose SONAME is
+      # libcuda.so.1 — a file that does not exist here because there is no
+      # driver. CMake links the stub fine, but every executable that links
+      # libggml-cuda.so then fails to resolve its DT_NEEDED. On any real machine
+      # libcuda.so.1 ships with the driver, so this is a container gap, not
+      # something to work around in CMake: give the container the SONAME.
+      - name: provide libcuda SONAME for the stub
+        run: |
+          STUBS=/usr/local/cuda/lib64/stubs
+          ln -sf "$STUBS/libcuda.so" "$STUBS/libcuda.so.1"
+          echo "$STUBS" > /etc/ld.so.conf.d/cuda-stubs.conf
+          ldconfig
       - uses: actions/checkout@v4
       # No GPU on hosted runners, so this is a compile check — which is exactly
       # what catches the merge-duplicate class of breakage.
-      # No linker flags on purpose: a devel container has only the libcuda stub,
-      # which is exactly the case src/ggml-cuda/CMakeLists.txt now handles. Adding
-      # -L stubs here would paper over that and stop testing the real path.
       - name: build
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
