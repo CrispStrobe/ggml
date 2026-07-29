@@ -194,19 +194,27 @@ if (CUDAToolkit_FOUND)
     # as a last resort disable VMM so the build still succeeds.
     if (GGML_CUDA_NO_VMM)
         # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
-    elseif (TARGET CUDA::cuda_driver)
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
     else()
+        # Resolve libcuda.so ourselves FIRST. CUDA::cuda_driver is unreliable: on
+        # Kaggle the imported target is not defined at all (configure hard-fails),
+        # and in nvidia/cuda devel containers it IS defined but contributes no
+        # library, so the link ends with undefined cuMemCreate/cuMemMap/...
+        # A concrete path works in both. Linking the stub is fine — it carries the
+        # same SONAME (libcuda.so.1), so the real driver is used at runtime.
         find_library(GGML_CUDA_DRIVER_LIB NAMES cuda
                      HINTS ${CUDAToolkit_LIBRARY_DIR}
                            ${CUDAToolkit_LIBRARY_ROOT}/lib64
                            /usr/local/cuda/lib64
+                           /usr/local/cuda/targets/x86_64-linux/lib
                      PATH_SUFFIXES stubs)
         if (GGML_CUDA_DRIVER_LIB)
-            message(STATUS "CUDA::cuda_driver not exported; linking ${GGML_CUDA_DRIVER_LIB}")
+            message(STATUS "ggml-cuda: linking CUDA driver ${GGML_CUDA_DRIVER_LIB}")
             target_link_libraries(ggml-cuda PRIVATE ${GGML_CUDA_DRIVER_LIB})
+        elseif (TARGET CUDA::cuda_driver)
+            message(STATUS "ggml-cuda: linking CUDA::cuda_driver")
+            target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
         else()
-            message(WARNING "libcuda not found — building with GGML_CUDA_NO_VMM")
+            message(WARNING "ggml-cuda: libcuda not found — building with GGML_CUDA_NO_VMM")
             target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_NO_VMM)
         endif()
     endif()
