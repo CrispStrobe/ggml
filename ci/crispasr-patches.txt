@@ -60,3 +60,4 @@
 
 # --- conv im2col patch buffer follows vec_dot_type (F16 conv_2d) -----------
 1	src/ggml-cpu/ops.cpp	patch_type
+1	src/ggml-cuda/getrows.cu	i11*nb02

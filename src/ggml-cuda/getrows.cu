@@ -21,18 +21,39 @@ static void get_rows_cuda_kquant(
     to_fp32_cuda_t dequant = ggml_get_to_fp32_cuda(src0_type);
     GGML_ASSERT(dequant != nullptr);
 
-    // Copy index tensor to host (typically 1-4 indices for embed lookups).
-    const int64_t n_ids = ne10 * ne11 * ne12;
-    std::vector<int32_t> ids_host(n_ids);
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), src1_d, n_ids * sizeof(int32_t),
+    // src1 strides arrive in BYTES here (the float launchers divide them down);
+    // convert to element strides to index the host copy.
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    // Copy the index tensor to host. Sized from the addressed SPAN, not from
+    // ne10*ne11*ne12: once ne11/ne12 > 1 the span exceeds the element count and
+    // the old code under-copied.
+    const size_t span = (ne10 > 0 && ne11 > 0 && ne12 > 0)
+        ? (size_t)((ne10 - 1)*s10 + (ne11 - 1)*s11 + (ne12 - 1)*s12) + 1
+        : 0;
+    if (span == 0) {
+        return;
+    }
+    std::vector<int32_t> ids_host(span);
+    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), src1_d, span * sizeof(int32_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    for (int64_t idx = 0; idx < n_ids; idx++) {
-        const int32_t row = ids_host[idx];
-        const void * src_row = (const char *)src0_d + (size_t)row * nb01;
-        float * dst_row = (float *)((char *)dst_d + idx * nb1);
-        dequant(src_row, dst_row, ne00, stream);
+    // Mirrors k_get_rows_float's indexing. The previous version flattened
+    // everything to one linear index and ignored nb02/nb03 and nb2/nb3, which is
+    // correct only when ne11 == ne12 == 1 — true for the plain embedding lookups
+    // it was written for, wrong for any batched/broadcast get_rows.
+    for (int64_t i12 = 0; i12 < ne12; i12++) {
+        for (int64_t i11 = 0; i11 < ne11; i11++) {
+            for (int64_t i10 = 0; i10 < ne10; i10++) {
+                const int32_t i01 = ids_host[i10*s10 + i11*s11 + i12*s12];
+                const void * src_row = (const char *) src0_d + (size_t) i01*nb01 + (size_t) i11*nb02 + (size_t) i12*nb03;
+                float * dst_row = (float *) ((char *) dst_d + (size_t) i10*nb1 + (size_t) i11*nb2 + (size_t) i12*nb3);
+                dequant(src_row, dst_row, ne00, stream);
+            }
+        }
     }
 }
 
