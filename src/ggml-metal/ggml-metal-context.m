@@ -452,7 +452,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     if (g_crisp_metal_prof < 0) {
         const char * e = getenv("CRISPASR_METAL_PROFILE");
         if (!e || !*e || *e == '0') g_crisp_metal_prof = 0;
-        else if (e[0] == '2')       g_crisp_metal_prof = 2; // per-op breakdown
+        else if (e[0] == '2' || e[0] == '3') g_crisp_metal_prof = 2; // per-op breakdown ('3' adds a per-node trace)
         else                        g_crisp_metal_prof = 1; // whole-graph host/gpu split
     }
     const bool crisp_prof = g_crisp_metal_prof == 1;
@@ -508,6 +508,23 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 node->op == GGML_OP_TRANSPOSE) { cur += 1; continue; }
             int res = 1;
             @autoreleasepool {
+                // CrispASR patch (CrispEmbed O6/sched-replay debugging): with
+                // CRISPASR_METAL_PROFILE=3 announce each node BEFORE encoding —
+                // when an encode faults on a stale buffer, the last line names
+                // the node. Costs a flush per node; profile output unchanged.
+                if (getenv("CRISPASR_METAL_PROFILE")[0] == '3') {
+                    fprintf(stderr, "[perop-trace] node %d op=%s name=%s buf=%p(%s) data=%p", cur,
+                            ggml_op_name(node->op), node->name, (void *) node->buffer,
+                            node->buffer ? ggml_backend_buffer_name(node->buffer) : "nil", node->data);
+                    for (int si = 0; si < GGML_MAX_SRC && node->src[si]; ++si) {
+                        const struct ggml_tensor * s = node->src[si];
+                        const struct ggml_tensor * sb = s->view_src ? s->view_src : s;
+                        fprintf(stderr, " src%d=%s buf=%p(%s) data=%p", si, s->name, (void *) sb->buffer,
+                                sb->buffer ? ggml_backend_buffer_name(sb->buffer) : "nil", s->data);
+                    }
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
+                }
                 id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
                 [cmd_buf retain];
                 ggml_metal_op_t op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, cur, gf->n_nodes,

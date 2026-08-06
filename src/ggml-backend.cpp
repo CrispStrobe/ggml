@@ -784,10 +784,19 @@ struct ggml_backend_sched_split {
 struct ggml_backend_sched_src_mutation {
     struct ggml_tensor * node;
     struct ggml_tensor * orig_src;
+    // CrispASR patch (CrispEmbed O6 / sched replay): the rewired src (the
+    // input-copy tensor in sched->ctx), so a repeat compute of the stored
+    // splits can re-apply the rewires that the previous compute's exit
+    // restored. Without this, alloc-once/compute-many executed the second
+    // compute with the ORIGINAL cross-backend srcs — on Metal that
+    // dereferences a CPU buffer's context as a Metal buffer (poisoned
+    // AGXBuffer, SIGSEGV at the second decode step; UOCR_PD_REPLAY repro).
+    struct ggml_tensor * new_src;
     int j;
 };
 
 static void ggml_backend_sched_restore_src_mutations(ggml_backend_sched_t sched);
+static void ggml_backend_sched_drop_src_mutations(ggml_backend_sched_t sched);
 
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
@@ -824,6 +833,14 @@ struct ggml_backend_sched {
     struct ggml_backend_sched_src_mutation * src_mutations;
     int n_src_mutations;
     int src_mutations_capacity;
+    // CrispASR patch (CrispEmbed O6 / sched replay): whether the recorded
+    // rewires are currently WRITTEN into the user's graph. true after
+    // split_graph (which leaves the graph mutated) and after apply; false
+    // after restore. Disposal (reset / next split) only writes the originals
+    // back when this is set — an already-restored log must be dropped
+    // WITHOUT writing, because the caller may have rebuilt a new graph over
+    // the old nodes' memory by then.
+    bool src_mutations_applied;
 
     // pipeline parallelism support
     int n_copies;
@@ -1042,10 +1059,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
 
-    // Drop any src[j] rewires still recorded from a prior compute that
-    // returned early. Restoring writes to the user's gf, not to
-    // sched->ctx, so it is safe to call before ggml_free(sched->ctx).
-    ggml_backend_sched_restore_src_mutations(sched);
+    // Drop any src[j] rewires still recorded from a prior allocation.
+    // Restoring writes to the user's gf, not to sched->ctx, so it is safe
+    // to call before ggml_free(sched->ctx).
+    ggml_backend_sched_drop_src_mutations(sched);
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -1411,8 +1428,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     sched->src_mutations[sched->n_src_mutations].node = node;
                     sched->src_mutations[sched->n_src_mutations].orig_src = src;
+                    // CrispASR patch (CrispEmbed O6 / sched replay): also record
+                    // the REWIRED src so compute_splits can re-apply it — see
+                    // ggml_backend_sched_apply_src_mutations.
+                    sched->src_mutations[sched->n_src_mutations].new_src =
+                        tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                     sched->src_mutations[sched->n_src_mutations].j = j;
                     sched->n_src_mutations++;
+                    sched->src_mutations_applied = true; // the graph leaves split_graph mutated
 
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
@@ -1595,12 +1618,60 @@ static void ggml_backend_sched_restore_src_mutations(ggml_backend_sched_t sched)
         const struct ggml_backend_sched_src_mutation * m = &sched->src_mutations[i];
         m->node->src[m->j] = m->orig_src;
     }
+    sched->src_mutations_applied = false;
+    // NOTE (CrispASR patch): do NOT zero n_src_mutations here — the log must
+    // survive so a repeat compute of the same allocation can re-apply the
+    // rewires (ggml_backend_sched_apply_src_mutations). The log is dropped
+    // where the allocation itself is dropped: sched_reset and the start of
+    // split_graph.
+}
+
+// CrispASR patch (CrispEmbed O6 / sched replay): re-apply the src rewires
+// recorded at split time. compute_splits' exit paths restore the user's
+// graph to its original state (so the caller's gf stays pristine), which
+// means a second compute of the SAME allocation would otherwise run the
+// stored splits with the original cross-backend srcs — the alloc-once/
+// compute-many pattern then faults inside the backend (Metal: a CPU
+// buffer's context dereferenced as a Metal buffer). Idempotent; paired
+// with the restore on every exit.
+static void ggml_backend_sched_apply_src_mutations(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_src_mutations; i++) {
+        const struct ggml_backend_sched_src_mutation * m = &sched->src_mutations[i];
+        m->node->src[m->j] = m->new_src;
+    }
+    sched->src_mutations_applied = sched->n_src_mutations > 0;
+}
+
+static void ggml_backend_sched_drop_src_mutations(ggml_backend_sched_t sched) {
+    // Two disposal cases, told apart by src_mutations_applied:
+    // - STILL APPLIED (an alloc that never computed — e.g. ppocr's
+    //   build-then-run flow resets between its alloc and its first compute):
+    //   the user's graph still carries the rewires and its nodes are alive
+    //   (nothing computed since the split), so write the originals back
+    //   first or the next split records copies-of-copies into a freed
+    //   sched->ctx (observed: ppocr decoded 0 regions).
+    // - ALREADY RESTORED (the normal reset-per-step flow): the caller may
+    //   have rebuilt a NEW graph over the old nodes' memory since the last
+    //   compute — writing would stamp stale srcs into recycled nodes
+    //   (observed: a vision-graph CPY asserting with a foreign src). Drop
+    //   without writing.
+    if (sched->src_mutations_applied) {
+        ggml_backend_sched_restore_src_mutations(sched);
+    }
     sched->n_src_mutations = 0;
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    // CrispASR patch (CrispEmbed O6 / sched replay): the previous compute's
+    // exit restored the user's graph, so a repeat compute of the same
+    // allocation must first re-apply the recorded src rewires or the stored
+    // splits execute with the original cross-backend srcs (Metal faulted on
+    // a CPU buffer at the second decode step). Idempotent no-op on the
+    // first compute after a split.
+    ggml_backend_sched_apply_src_mutations(sched);
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1890,7 +1961,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
-        ggml_backend_sched_restore_src_mutations(sched);
+        ggml_backend_sched_drop_src_mutations(sched);
         sched->is_reset = true;
     }
     sched->is_alloc = false;

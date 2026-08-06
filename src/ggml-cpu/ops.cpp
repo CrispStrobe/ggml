@@ -329,6 +329,14 @@ static void ggml_compute_forward_dup_bytes(
         ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
+    // CrispASR patch (debugging aid): name the offending tensors before the
+    // abort — an optimized build hides the locals from the debugger.
+    if (ggml_nelements(dst) != ggml_nelements(src0)) {
+        fprintf(stderr, "dup_bytes mismatch: dst='%s' ne=[%lld,%lld,%lld,%lld] src0='%s' ne=[%lld,%lld,%lld,%lld]\n",
+                dst->name, (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2],
+                (long long) dst->ne[3], src0->name, (long long) src0->ne[0], (long long) src0->ne[1],
+                (long long) src0->ne[2], (long long) src0->ne[3]);
+    }
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
     GGML_ASSERT(src0->type == dst->type);
 
