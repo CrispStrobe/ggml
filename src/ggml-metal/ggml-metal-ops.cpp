@@ -3986,11 +3986,26 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
         /*.KH   =*/ KH,
         /*.KW   =*/ KW,
         /*.KHW  =*/ KH * KW,
+        /*.OW   =*/ OW,
+        /*.OH   =*/ OH,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_im2col(lib, op);
 
-    if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+    // CrispASR patch (CrispEmbed ppocr rec): flat one-thread-per-element
+    // dispatch for shapes whose standard (N, KH, KW) threadgroup is tiny —
+    // the getter returned kernel_im2col_flat for exactly these ops.
+    if (ggml_metal_im2col_use_flat(op)) {
+        const int64_t owchw = (int64_t) OW * CHW;
+        const int64_t ntg   = 256;
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (owchw + ntg - 1)/ntg, OH, N, ntg, 1, 1);
+    } else if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         const uint64_t ntptg0 = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/(KH*KW), N);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);

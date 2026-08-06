@@ -5029,6 +5029,63 @@ kernel void kernel_im2col(
 template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
 template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
 
+// CrispASR patch (CrispEmbed ppocr rec, successor to the pre-v0.17
+// CRISPASR_METAL_IM2COL_OCC variant noted above — re-derived against the new
+// dispatch): the standard kernel launches (N, KH, KW)-thread threadgroups, so a
+// 1x1 convolution over a small batch (PP-OCR rec: N=8, KH=KW=1) runs 8-thread
+// threadgroups across IC*OH*OW groups — a quarter of one simdgroup each, and
+// measured 70% of the whole recognizer graph (~30 ms per ~11 MB copy). This
+// variant assigns one thread per dst element from a flat 256-thread dispatch;
+// byte-identical output ordering. Selected in ggml_metal_op_im2col only when
+// the standard threadgroup would be tiny.
+template <typename T>
+kernel void kernel_im2col_flat(
+        constant ggml_metal_kargs_im2col & args,
+        device const float * x,
+        device        char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    // Grid: (ceil(OW*CHW/ntg0), OH, N) — ioh and in ride the grid for free;
+    // only the row-local index needs divmods, and 32-bit ones (int64 division
+    // is emulated on Apple GPUs and dominated the first cut of this kernel).
+    const uint32_t idx0 = tgpig[0]*ntg[0] + tpitg[0]; // iow*CHW + chw
+    const uint32_t OWCHW = (uint32_t) args.OW * (uint32_t) args.CHW;
+    if (idx0 >= OWCHW) {
+        return;
+    }
+
+    const uint32_t ioh = tgpig[1];
+    const uint32_t in  = tgpig[2];
+
+    const uint32_t chw = idx0 % (uint32_t) args.CHW;
+    const uint32_t iow = idx0 / (uint32_t) args.CHW;
+
+    const uint32_t iic = chw / (uint32_t) args.KHW;
+    const uint32_t k   = chw % (uint32_t) args.KHW;
+    const uint32_t ikh = k / (uint32_t) args.KW;
+    const uint32_t ikw = k % (uint32_t) args.KW;
+
+    const int32_t iiw = (int32_t) iow*args.s0 + (int32_t) ikw*args.d0 - args.p0;
+    const int32_t iih = (int32_t) ioh*args.s1 + (int32_t) ikh*args.d1 - args.p1;
+
+    // dst layout: ((in*OH + ioh)*OW + iow)*CHW + chw — identical to
+    // kernel_im2col's offset_dst; contiguous across the threadgroup.
+    const int64_t offset_dst = ((int64_t) in*args.OH + ioh)*OWCHW + idx0;
+
+    device T * pdst = (device T *) (dst);
+
+    if (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) {
+        pdst[offset_dst] = 0.0f;
+    } else {
+        pdst[offset_dst] = x[(int64_t) in*args.ofs0 + (int64_t) iic*args.ofs1 + (int64_t) iih*args.IW + iiw];
+    }
+}
+
+template [[host_name("kernel_im2col_flat_f32")]] kernel im2col_t kernel_im2col_flat<float>;
+template [[host_name("kernel_im2col_flat_f16")]] kernel im2col_t kernel_im2col_flat<half>;
+
 // TODO: optimize
 typedef void (im2col_ext_t)(
         constant ggml_metal_kargs_im2col & args,

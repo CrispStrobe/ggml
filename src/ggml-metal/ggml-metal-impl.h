@@ -788,6 +788,10 @@ typedef struct {
     int32_t  KH;
     int32_t  KW;
     int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
+    // CrispASR patch (CrispEmbed ppocr rec): OW/OH for kernel_im2col_flat,
+    // whose flat dispatch no longer encodes them in the threadgroup grid.
+    int32_t  OW;
+    int32_t  OH;
 } ggml_metal_kargs_im2col;
 
 typedef struct {

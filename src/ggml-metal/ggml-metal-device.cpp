@@ -1799,6 +1799,42 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope(ggml_metal_
     return res;
 }
 
+// CrispASR patch (CrispEmbed ppocr rec): the standard im2col kernel launches
+// (N, KH, KW)-thread threadgroups across an IC x OH x OW grid, so a 1x1
+// convolution over a small batch (PP-OCR rec: N=8, KH=KW=1) runs 8-thread
+// threadgroups — a quarter of one simdgroup each; measured 70% of the whole
+// recognizer graph on M1 (~30 ms per ~11 MB materialization). For such shapes
+// use kernel_im2col_flat (one thread per dst element, 256-thread groups).
+// Predicate shared by the pipeline getter and the encoder so they cannot
+// disagree. CRISPASR_METAL_IM2COL_FLAT: unset/1 = auto, 0 = legacy kernel.
+bool ggml_metal_im2col_use_flat(const struct ggml_tensor * op) {
+    static const int flat_env = [] {
+        const char * e = getenv("CRISPASR_METAL_IM2COL_FLAT");
+        return (e && e[0] == '0' && e[1] == '\0') ? 0 : 1;
+    }();
+    if (flat_env == 0) {
+        return false;
+    }
+
+    const bool is_2D = ((const int32_t *)(op->op_params))[6] == 1;
+
+    const int64_t N  = op->src[1]->ne[is_2D ? 3 : 2];
+    const int64_t IC = op->src[1]->ne[is_2D ? 2 : 1];
+    const int64_t KH = is_2D ? op->src[0]->ne[1] : 1;
+    const int64_t KW = op->src[0]->ne[0];
+
+    // Two measured-pathological shapes for the standard kernel:
+    // - tiny threadgroups: it holds min(max_threads/(KH*KW), N)*KH*KW <=
+    //   N*KH*KW threads per group; below ~4 simdgroups the dispatch is
+    //   occupancy-bound;
+    // - the ggml_conv_2d_dw lowering (IC==1, N=C*batch): each thread loops
+    //   N/ntg0 times with both src and dst strides of a full plane — zero
+    //   coalescing either side (~0.4 GB/s on M1; 70% of the PP-OCR medium
+    //   recognizer graph). The flat kernel's dst-ordered mapping makes writes
+    //   contiguous and reads 2D-local per channel plane.
+    return N*KH*KW < 128 || IC == 1;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_IM2COL);
 
@@ -1815,7 +1851,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_meta
     char base[256];
     char name[256];
 
-    if (KH*KW <= 1024) {
+    if (ggml_metal_im2col_use_flat(op)) {
+        snprintf(base, 256, "kernel_im2col_flat_%s", ggml_type_name(op->type));
+    } else if (KH*KW <= 1024) {
         snprintf(base, 256, "kernel_im2col_%s", ggml_type_name(op->type));
     } else {
         snprintf(base, 256, "kernel_im2col_ext_%s", ggml_type_name(op->type));

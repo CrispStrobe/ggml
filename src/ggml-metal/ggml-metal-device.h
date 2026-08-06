@@ -147,6 +147,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm  
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope              (ggml_metal_library_t lib, const struct ggml_tensor * op);
+// CrispASR patch (CrispEmbed ppocr rec): shared predicate — true when the op
+// should use kernel_im2col_flat (see ggml-metal-device.cpp).
+bool ggml_metal_im2col_use_flat(const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1d (ggml_metal_library_t lib, const struct ggml_tensor * op);
 // CrispASR patch (PR #160 col2im_1d) — MUST RE-APPLY after ggml bump.
