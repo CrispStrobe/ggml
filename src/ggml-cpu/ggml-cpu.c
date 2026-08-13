@@ -202,6 +202,8 @@ typedef void * thread_ret_t;
 
 typedef pthread_t ggml_thread_t;
 
+static atomic_bool ggml_table_f32_ue4m3_initialized = false;
+
 #define GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
 #define GGML_THREADPOOL_N_THREADS_BITS (16)
 
@@ -3837,6 +3839,27 @@ int ggml_cpu_has_sme2(void) {
 #endif
 }
 
+static void ggml_cpu_init_ue4m3_table_unlocked(void) {
+    if (atomic_load_explicit(&ggml_table_f32_ue4m3_initialized, memory_order_acquire)) {
+        return;
+    }
+
+    for (int i = 0; i < (1 << 8); ++i) {
+        ggml_table_f32_ue4m3[i] = ggml_ue4m3_to_fp32(i);
+    }
+    atomic_store_explicit(&ggml_table_f32_ue4m3_initialized, true, memory_order_release);
+}
+
+void ggml_cpu_ensure_ue4m3_table(void) {
+    if (atomic_load_explicit(&ggml_table_f32_ue4m3_initialized, memory_order_acquire)) {
+        return;
+    }
+
+    ggml_critical_section_start();
+    ggml_cpu_init_ue4m3_table_unlocked();
+    ggml_critical_section_end();
+}
+
 void ggml_cpu_init(void) {
     // needed to initialize ggml_time
     {
@@ -3870,9 +3893,13 @@ void ggml_cpu_init(void) {
                 ggml_table_f32_e8m0_half[i] = GGML_E8M0_TO_FP32_HALF(i);
             }
 
-            // initialize UE4M3 table (256 entries)
-            for (int i = 0; i < (1 << 8); ++i) {
-                ggml_table_f32_ue4m3[i] = ggml_ue4m3_to_fp32(i);
+            // UE4M3 is consumed only by NVFP4 CPU dot products.  Keep it out
+            // of unconditional backend startup so GPU-only processes do not
+            // execute this model-specific CPU path.  The eager switch is an
+            // A/B and compatibility escape hatch; lazy is the safe default.
+            const char * eager_ue4m3 = getenv("GGML_CPU_EAGER_UE4M3_LUT");
+            if (eager_ue4m3 != NULL && atoi(eager_ue4m3) != 0) {
+                ggml_cpu_init_ue4m3_table_unlocked();
             }
 
             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);

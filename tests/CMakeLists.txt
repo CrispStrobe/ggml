@@ -177,7 +177,6 @@ if (NOT GGML_BACKEND_DL)
     target_link_libraries(${TEST_TARGET} PRIVATE ggml)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
-
     #
     # test-quantize-fns
 
@@ -186,6 +185,9 @@ if (NOT GGML_BACKEND_DL)
     target_link_libraries(${TEST_TARGET} PRIVATE ggml)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+    add_test(NAME test-quantize-fns-eager-ue4m3 COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST test-quantize-fns-eager-ue4m3 PROPERTY ENVIRONMENT
+        "GGML_CPU_EAGER_UE4M3_LUT=1;LLVM_PROFILE_FILE=test-quantize-fns-eager-ue4m3.profraw")
 
     #
     # test-quantize-perf

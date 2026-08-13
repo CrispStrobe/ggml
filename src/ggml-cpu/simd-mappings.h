@@ -124,6 +124,11 @@ extern float ggml_table_f32_e8m0_half[1 << 8];
 // defined in ggml-cpu.c, initialized in ggml_cpu_init()
 extern float ggml_table_f32_ue4m3[1 << 8];
 
+// The UE4M3 table is deliberately lazy: eagerly filling it from ggml_cpu_init
+// made an otherwise GPU-only process execute newly compiled CPU code during
+// backend enumeration.  This is a cheap atomic fast path after the first call.
+void ggml_cpu_ensure_ue4m3_table(void);
+
 // Use lookup table for E8M0 on x86 (faster than bit manipulation)
 #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
 #define GGML_CPU_E8M0_TO_FP32_HALF(x) ggml_table_f32_e8m0_half[(uint8_t)(x)]
