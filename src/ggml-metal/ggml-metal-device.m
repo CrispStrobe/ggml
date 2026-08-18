@@ -1588,6 +1588,25 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+            // This is an allow-all-but-a-few check, so any weight type WITHOUT a
+            // Metal matmul kernel is claimed as supported, scheduled onto Metal,
+            // and then fails hard when the pipeline lookup misses:
+            //
+            //   failed to compile pipeline: base = 'kernel_mul_mm_tq2_0_f32'
+            //   Function kernel_mul_mm_tq2_0_f32 was not found in the library
+            //
+            // A TQ2_0 model (BitNet/ternary — vibevoice-asr-bitnet) therefore
+            // produced an EMPTY transcript on Metal while transcribing correctly
+            // on CPU. Declaring the type unsupported lets the scheduler fall back
+            // instead, which is slower but correct.
+            //
+            // TQ1_0/TQ2_0 are the only *weight* types missing here: the other
+            // gaps are CPU-only repacks (Q4_0_4_4 and friends, produced by repack
+            // on CPU so they never reach this backend), removed types (Q4_2/Q4_3)
+            // or activation-side types (Q8_1/Q8_K) that are not a matmul src0.
+            if (op->src[0]->type == GGML_TYPE_TQ1_0 || op->src[0]->type == GGML_TYPE_TQ2_0) {
+                return false;
+            }
             return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET:
         case GGML_OP_CPY:
