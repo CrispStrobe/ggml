@@ -86,7 +86,8 @@ jobs:
                                   spirv-headers vulkan-tools mesa-vulkan-drivers
       - name: build
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DGGML_VULKAN=ON -DGGML_CONV1D_VIA_CONV2D=ON
           cmake --build build -j$(nproc)
       # lavapipe is a software Vulkan device, so the kernels actually execute on
       # a hosted runner — a compile-only check would miss miscomputes.
