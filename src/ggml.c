@@ -4578,6 +4578,29 @@ struct ggml_tensor * ggml_conv_1d(
         int                   s0,
         int                   p0,
         int                   d0) {
+#ifdef GGML_CONV1D_VIA_CONV2D
+    // Optionally lower Conv1D to the existing direct Conv2D implementation.
+    // Setting GGML_CONV1D_VIA_CONV2D=0 restores the legacy
+    // im2col + mul_mat path without rebuilding.
+    const char * const conv2d_env = getenv("GGML_CONV1D_VIA_CONV2D");
+    const bool use_conv2d = conv2d_env == NULL || conv2d_env[0] != '0';
+
+    // Conv1D:
+    //   weights [K, IC, OC] -> [K, 1, IC, OC]
+    //   input   [T, IC, N]  -> [T, 1, IC, N]
+    // The singleton dimension is introduced with zero-copy reshapes.
+    const bool conv2d_compatible =
+        (a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32) && a->ne[3] == 1 && ggml_is_contiguous(a) &&
+         b->type == GGML_TYPE_F32 && b->ne[3] == 1 && ggml_is_contiguous(b);
+
+    if (use_conv2d && conv2d_compatible) {
+        struct ggml_tensor * a4 = ggml_reshape_4d(ctx, a, a->ne[0], 1, a->ne[1], a->ne[2]);
+        struct ggml_tensor * b4 = ggml_reshape_4d(ctx, b, b->ne[0], 1, b->ne[1], b->ne[2]);
+        struct ggml_tensor * y4 = ggml_conv_2d_direct(ctx, a4, b4, s0, 1, p0, 0, d0, 1);
+
+        return ggml_reshape_3d(ctx, y4, y4->ne[0], y4->ne[2], y4->ne[3]);
+    }
+#endif
     // CrispASR fork (issue #38 companion): pick im2col output type based on
     // whether either side is F32. Upstream hardcodes F16, which produces
     // MUL_MAT(F16, F16) — unsupported by the CPU backend after our F16

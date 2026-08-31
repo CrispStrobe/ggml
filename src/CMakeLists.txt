@@ -214,6 +214,10 @@ set_target_properties(ggml-base PROPERTIES
 )
 
 target_include_directories(ggml-base PRIVATE .)
+
+if (GGML_CONV1D_VIA_CONV2D)
+    target_compile_definitions(ggml-base PRIVATE GGML_CONV1D_VIA_CONV2D)
+endif()
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()
