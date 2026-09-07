@@ -14,12 +14,13 @@
 # green without that justification defeats the entire point.
 
 # --- new ops we add to the ordered GGML_OP_* enum -------------------------
+# COL2IM_1D and its CPU/CUDA/Metal/Vulkan implementations are upstream-owned
+# as of v0.23; they were removed from this carried-patch list during the sync.
 1	include/ggml.h	GGML_OP_NORM_AFFINE
-1	include/ggml.h	GGML_OP_COL2IM_1D
 1	include/ggml.h	GGML_OP_AA_SNAKE_BETA
 1	include/ggml.h	ggml_norm_affine
 1	include/ggml.h	ggml_aa_snake_beta
-2	src/ggml.c	GGML_OP_COUNT == 99
+2	src/ggml.c	GGML_OP_COUNT == 103
 
 # --- issue #38: F16 vec_dot_type = F32 to avoid saturating F32->F16 -------
 # vfmaq_f16 accumulates in an F16 register and overflows at 65504, which turns
@@ -36,7 +37,8 @@
 1	src/ggml-cpu/ops.h	ggml_compute_forward_aa_snake_beta
 
 # --- Metal ----------------------------------------------------------------
-1	src/ggml-metal/ggml-metal.metal	aa_snake_beta
+1	src/ggml-metal/kernels/aa_snake_beta.metal	aa_snake_beta
+1	src/ggml-metal/kernels/conv.metal	kernel_im2col_flat
 1	src/ggml-metal/ggml-metal-ops.cpp	aa_snake_beta
 1	src/ggml-metal/ggml-metal-device.cpp	aa_snake_beta
 1	src/ggml-metal/ggml-metal-device.m	crispasr_metal_pipeline_cache
@@ -44,20 +46,21 @@
 # so do not add one here expecting it to exist.
 
 # --- Vulkan ---------------------------------------------------------------
-1	src/ggml-vulkan/ggml-vulkan.cpp	pipeline_col2im_1d_f32
 1	src/ggml-vulkan/ggml-vulkan.cpp	conv_transpose_1d_f16
-# NOTE: pipeline_snake_f32 is upstream's and arrives with the v0.17 sync;
-# this branch predates it, so it is not checked here.
+1	src/ggml-vulkan/ggml-vulkan.cpp	pipeline_snake_f32
 
 # --- CUDA -----------------------------------------------------------------
-1	src/ggml-cuda/im2col.cu	CrispASR patch
+# The long-grid IM2COL fix is upstream-owned as of v0.23.
 1	src/ggml-cuda/norm.cu	CrispASR patch
 1	src/ggml-cuda/ggml-cuda.cu	CrispASR patch
 
 # --- CUDA build robustness -------------------------------------------------
-# The CUDA::cuda_driver link guard (GGML_CUDA_DRIVER_LIB) only matters once the
-# v0.17 VMM pool lands; this branch has no such link, so nothing to check.
+# Upstream links the CUDA::cuda_driver imported target unconditionally for the
+# VMM pool; it is not always defined (Kaggle, nvidia/cuda devel containers).
+1	src/ggml-cuda/CMakeLists.txt	GGML_CUDA_DRIVER_LIB
 
-# --- conv im2col patch buffer follows vec_dot_type (F16 conv_2d) -----------
-1	src/ggml-cpu/ops.cpp	patch_type
-1	src/ggml-cuda/getrows.cu	i11*nb02
+# --- WebGPU ops still absent upstream v0.23 -------------------------------
+1	src/ggml-webgpu/wgsl-shaders/arange.wgsl	fn main
+1	src/ggml-webgpu/wgsl-shaders/pool2d.wgsl	fn main
+1	src/ggml-webgpu/wgsl-shaders/conv_transpose_2d.wgsl	fn main
+1	src/ggml-webgpu/ggml-webgpu.cpp	get_conv_transpose_2d_pipeline

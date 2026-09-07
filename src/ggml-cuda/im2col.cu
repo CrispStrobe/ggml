@@ -1,12 +1,5 @@
 #include "im2col.cuh"
 
-// CrispASR patch: clamp grid.y to MAX_GRIDDIM_Y and loop inside the kernel.
-// Upstream uses OW directly as block_nums.y; CUDA caps grid Y at 65535, so
-// conv1d encoders on long audio (e.g. SEANet at 11s/16kHz → OW = 176000)
-// would abort with "invalid configuration argument". Fix mirrors the
-// existing MAX_GRIDDIM_Z stride-loop pattern; applies to both im2col_kernel
-// (2D) and im2col_3d_kernel (added since v0.10.0). Must re-apply after
-// every ggml bump. See LEARNINGS.md "ggml fork patches we carry".
 #define MAX_GRIDDIM_Y 65535
 #define MAX_GRIDDIM_Z 65535
 

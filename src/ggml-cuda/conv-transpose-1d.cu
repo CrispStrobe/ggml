@@ -13,31 +13,36 @@ static __global__ void conv_transpose_1d_kernel(
         return;
     }
 
-    const int out_index = global_index / dst_ne0;
-    const int idx = global_index % dst_ne0;
-
-    // Analytical i_min/i_max: for output position idx, only input i in
-    // [i*s0, i*s0+K) contributes.  Iterate the tight range instead of
-    // scanning all src1_ne0 with an if-continue (avoids TDR at TTS scale).
-    const int a = idx - src0_ne0 + 1;
-    const int i_min = a <= 0 ? 0 : (a + s0 - 1) / s0;
-    const int i_max = min(idx / s0, src1_ne0 - 1);
+    int out_t = global_index % dst_ne0;
+    int out_ch = (global_index / dst_ne0) % dst_ne1;
+    int plane = global_index / (dst_ne0 * dst_ne1);
 
     float accumulator = 0;
-    if (i_min <= i_max) {
-        for (int c = 0; c < src0_ne2; c++) {
-            const int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
-            const int input_offset = src1_ne0 * c;
-            for (int i = i_min; i <= i_max; i++) {
-                const int weight_idx = idx - i*s0;
-                const float kernel_weight = ggml_cuda_cast<float>(src0[kernel_offset + weight_idx]);
-                const float input_value = src1[input_offset + i];
-                accumulator += kernel_weight * input_value;
+
+    for (int c = 0; c < src0_ne2; c++) {
+        int kernel_offset = src0_ne0 * (out_ch + src0_ne1 * c);
+        int input_offset = src1_ne0 * (c + src1_ne1 * plane);
+
+        for (int k = 0; k < src0_ne0; k++) {
+            int input_numer = out_t + p0 - k*d0;
+            if (input_numer < 0 || input_numer % s0 != 0) {
+                continue;
             }
+
+            int input_t = input_numer / s0;
+            if (input_t >= src1_ne0) {
+                continue;
+            }
+
+            // CrispASR patch (upstream-prs 14: F16 kernel weights) — MUST RE-APPLY
+            // after every ggml bump. src0_t is float OR half; `half * float` is
+            // ambiguous to nvcc ("more than one operator * matches"), so widen the
+            // weight explicitly rather than relying on an implicit conversion.
+            accumulator += ggml_cuda_cast<float>(src0[kernel_offset + k]) * src1[input_offset + input_t];
         }
     }
     dst[global_index] = accumulator;
-    GGML_UNUSED_VARS(p0, d0, src0_ne3, src1_ne3, dst_ne3, src1_ne1, dst_ne1, src1_ne2, dst_ne2);
+    GGML_UNUSED_VARS(src0_ne3, src1_ne2, src1_ne3, dst_ne2, dst_ne3);
 }
 
 template <typename src0_t>
