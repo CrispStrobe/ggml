@@ -42,6 +42,8 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_blk(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_tmp(const struct ggml_tensor * op);
+size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const struct ggml_tensor * op);
+size_t ggml_metal_op_flash_attn_ext_extra_idx(const struct ggml_tensor * op);
 
 // CrispASR patch (#83): extra Q8_K-quantized input buffer when an op
 // carries GGML_PREC_F32 with Q4_K weights × F32 input. Used by the
@@ -64,6 +66,8 @@ int ggml_metal_op_cumsum            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_get_rows          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_set_rows          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_diag              (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_hc           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_soft_max          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
@@ -74,11 +78,13 @@ int ggml_metal_op_set               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_cpy               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pool_1d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pool_2d           (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_fwht              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat_id        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_add_id            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_flash_attn_ext    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_silu_back         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_group_norm        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_norm              (ggml_metal_op_t ctx, int idx);
