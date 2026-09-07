@@ -14,7 +14,7 @@ name: crispasr-ops
 
 on:
   push:
-    branches: [crispstrobe-ops, 'sync/**']
+    branches: [crispstrobe-ops]
   pull_request:
     branches: [crispstrobe-ops]
   workflow_dispatch:
