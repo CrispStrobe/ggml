@@ -37,7 +37,7 @@
 1	src/ggml-cpu/ops.h	ggml_compute_forward_aa_snake_beta
 
 # --- Metal ----------------------------------------------------------------
-1	src/ggml-metal/kernels/aa-snake-beta.metal	aa_snake_beta
+1	src/ggml-metal/kernels/aa_snake_beta.metal	aa_snake_beta
 1	src/ggml-metal/ggml-metal-ops.cpp	aa_snake_beta
 1	src/ggml-metal/ggml-metal-device.cpp	aa_snake_beta
 1	src/ggml-metal/ggml-metal-device.m	crispasr_metal_pipeline_cache
