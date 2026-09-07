@@ -123,5 +123,6 @@ jobs:
       - name: build
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-                -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="75;86"
+                -DGGML_CUDA=ON -DGGML_CUDA_CRISPASR_FA_PERHEAD_MASK=ON \
+                -DCMAKE_CUDA_ARCHITECTURES="75;86"
           cmake --build build -j$(nproc)
