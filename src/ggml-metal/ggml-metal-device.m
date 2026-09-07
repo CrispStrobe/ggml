@@ -99,14 +99,50 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     return pipeline.pipeline->obj.maxTotalThreadsPerThreadgroup;
 }
 
-// CrispASR patch (PLAN #88 / CrisperWeaver §5.18): forward
-// declarations for the pipeline-cache accessors. The full
-// `struct ggml_metal_device` lives further down in this file
-// because of historical ordering; the library functions above
-// can't peek into it directly, so they go through these tiny
-// accessors. Both return nil / no-op when caching is disabled.
-static id<MTLBinaryArchive> crispasr_metal_device_archive(ggml_metal_device_t dev);
-static void crispasr_metal_device_mark_archive_dirty(ggml_metal_device_t dev);
+//
+// MTLLibrary collection (one library per op-source, compiled separately)
+//
+
+// Single source of truth for the per-kind metal libraries. The order here
+// defines the enum values and every per-kind table below, so adding a library
+// is a one-line change here (plus adding its source to CMakeLists.txt).
+//   X(suffix, name): name is both the kernels/<name>.metal basename and the
+//   ggml_metallib_<name>_{start,end} embed-symbol stem.
+#define GGML_METAL_LIBS \
+    X(FA,              fa)             \
+    X(MUL_MV,          mul_mv)         \
+    X(MUL_MM,          mul_mm)         \
+    X(QUANTIZE,        quantize)       \
+    X(SOFTMAX,         softmax)        \
+    X(NORM,            norm)           \
+    X(UNARY,           unary)          \
+    X(BINBCAST,        binbcast)       \
+    X(REDUCE,          reduce)         \
+    X(TRI,             tri)            \
+    X(SSM,             ssm)            \
+    X(WKV,             wkv)            \
+    X(GATED_DELTA_NET, gated_delta_net)\
+    X(SOLVE_TRI,       solve_tri)      \
+    X(ROPE,            rope)           \
+    X(CONV,            conv)           \
+    X(AA_SNAKE_BETA,   aa_snake_beta)  \
+    X(UPSCALE,         upscale)        \
+    X(ARGSORT,         argsort)        \
+    X(POOL,            pool)           \
+    X(MISC,            misc)
+
+enum ggml_metal_lib_kind {
+#define X(e, s) GGML_METAL_LIB_##e,
+    GGML_METAL_LIBS
+#undef X
+    GGML_METAL_LIB_COUNT,
+};
+
+static const char * const k_lib_names[GGML_METAL_LIB_COUNT] = {
+#define X(e, s) [GGML_METAL_LIB_##e] = #s,
+    GGML_METAL_LIBS
+#undef X
+};
 
 struct ggml_metal_library {
     // Per-kind compiled libraries. When single_library is true, the whole library
@@ -147,49 +183,15 @@ static void ggml_metal_library_build_index(ggml_metal_library_t lib) {
 
 // note: defined below, after struct ggml_metal_device
 static void ggml_metal_device_disable_tensor(ggml_metal_device_t dev);
+// CrispASR: persistent Metal pipeline cache accessors.  The device
+// structure is defined below the library implementation.
+static id<MTLBinaryArchive> crispasr_metal_device_archive(ggml_metal_device_t dev);
+static void crispasr_metal_device_mark_archive_dirty(ggml_metal_device_t dev);
 
-                if (ggml_metal_device_get_props(dev)->has_bfloat) {
-                    [prep setObject:@"1" forKey:@"GGML_METAL_HAS_BF16"];
-                }
-
-                if (ggml_metal_device_get_props(dev)->has_tensor) {
-                    [prep setObject:@"1" forKey:@"GGML_METAL_HAS_TENSOR"];
-                }
-
-#if GGML_METAL_EMBED_LIBRARY
-                [prep setObject:@"1" forKey:@"GGML_METAL_EMBED_LIBRARY"];
-#endif
-
-                MTLCompileOptions * options = [MTLCompileOptions new];
-                options.preprocessorMacros = prep;
-
-                // CrispASR patch (#83): disable fast-math when CRISPASR_METAL_STRICT_FP=1.
-                // Fast-math allows the compiler to fuse multiplies (FMA can be more
-                // accurate, but operand reordering may downconvert F32 to F16-precision
-                // intermediates inside `dot()` and other built-ins). Strict FP gives
-                // bit-identical CPU/GPU output for chatterbox K projection at the cost
-                // of some throughput.
-                if (getenv("CRISPASR_METAL_STRICT_FP")) {
-                    [options setFastMathEnabled:NO];
-                }
-
-                library = [device newLibraryWithSource:src options:options error:&error];
-                if (error) {
-                    GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
-                    return nil;
-                }
-
-#if !__has_feature(objc_arc)
-                [options release];
-#endif
-            }
-        }
-
-#if GGML_METAL_EMBED_LIBRARY
-        [src release];
-#endif // GGML_METAL_EMBED_LIBRARY
-
-        GGML_LOG_INFO("%s: loaded in %.3f sec\n", __func__, (ggml_time_us() - t_start) / 1e6);
+// the tensor API headers are exposed to the shader compiler only at Metal language version 4.0
+static void ggml_metal_compile_options_set_lang(MTLCompileOptions * options, bool has_tensor) {
+    if (!has_tensor) {
+        return;
     }
 
     options.languageVersion = (MTLLanguageVersion) MTLLanguageVersion4_0_GGML;
@@ -334,6 +336,9 @@ static bool ggml_metal_library_compile_all(
             @autoreleasepool {
                 MTLCompileOptions * options = [MTLCompileOptions new];
                 options.preprocessorMacros = prep;
+                if (getenv("CRISPASR_METAL_STRICT_FP")) {
+                    options.fastMathEnabled = NO;
+                }
                 ggml_metal_compile_options_set_lang(options, ggml_metal_device_get_props(res->dev)->has_tensor);
 
                 lib = [device newLibraryWithSource:src options:options error:&error];
@@ -612,6 +617,9 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
 
         MTLCompileOptions * options = [MTLCompileOptions new];
         options.preprocessorMacros = prep;
+        if (getenv("CRISPASR_METAL_STRICT_FP")) {
+            options.fastMathEnabled = NO;
+        }
         ggml_metal_compile_options_set_lang(options, ggml_metal_device_get_props(dev)->has_tensor);
 
         library = [device newLibraryWithSource:src options:options error:&error];
@@ -770,44 +778,30 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         }
 
         id<MTLDevice> device = ggml_metal_device_get_obj(lib->dev);
-
-        // CrispASR patch (PLAN #88 / CrisperWeaver §5.18): pipeline
-        // cache hookup. When the device's binary archive is open,
-        // attach it via `MTLComputePipelineDescriptor.binaryArchives`
-        // so Metal first checks the archive for a matching PSO and
-        // skips the shader compiler on hit. After successful
-        // creation we add the descriptor BACK to the archive so the
-        // next process startup sees it on disk. Failures here are
-        // intentionally non-fatal — pipeline compile already
-        // succeeded (`obj` is valid), and the worst case for an
-        // add-to-archive miss is a missed cache entry on the next
-        // run, not a broken inference today.
-        id<MTLComputePipelineState> obj = nil;
-        MTLComputePipelineDescriptor * pdesc = [MTLComputePipelineDescriptor new];
-        pdesc.computeFunction = mtl_function;
         id<MTLBinaryArchive> archive = crispasr_metal_device_archive(lib->dev);
+        id<MTLComputePipelineState> obj = nil;
         if (archive) {
-            pdesc.binaryArchives = @[archive];
-        }
-        obj = [device newComputePipelineStateWithDescriptor:pdesc
-                                                    options:MTLPipelineOptionNone
-                                                 reflection:nil
-                                                      error:&error];
-
-        if (obj && archive) {
-            NSError * add_err = nil;
-            if ([archive addComputePipelineFunctionsWithDescriptor:pdesc error:&add_err]) {
-                crispasr_metal_device_mark_archive_dirty(lib->dev);
-            } else if (add_err) {
-                // Logged at DEBUG because some functions can't be
-                // archived (linker-resolved ones, MPS-backed paths)
-                // and that's neither rare nor a real problem.
-                GGML_LOG_DEBUG("%s: add-to-archive skipped for '%s': %s\n",
-                        __func__, name, [[add_err description] UTF8String]);
+            MTLComputePipelineDescriptor * desc = [MTLComputePipelineDescriptor new];
+            desc.computeFunction = mtl_function;
+            desc.binaryArchives = @[archive];
+            obj = [device newComputePipelineStateWithDescriptor:desc
+                                                        options:MTLPipelineOptionNone
+                                                     reflection:nil
+                                                          error:&error];
+            if (obj) {
+                NSError * archive_error = nil;
+                if ([archive addComputePipelineFunctionsWithDescriptor:desc error:&archive_error]) {
+                    crispasr_metal_device_mark_archive_dirty(lib->dev);
+                } else if (archive_error) {
+                    GGML_LOG_DEBUG("%s: pipeline archive skipped '%s': %s\n", __func__, name,
+                            [[archive_error description] UTF8String]);
+                }
             }
+            [desc release];
+        } else {
+            obj = [device newComputePipelineStateWithFunction:mtl_function error:&error];
         }
 
-        [pdesc release];
         [mtl_function release];
 
         if (!obj) {
@@ -938,26 +932,89 @@ struct ggml_metal_device {
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
 
-    // CrispASR patch (PLAN #88 / CrisperWeaver §5.18): persistent
-    // Metal pipeline cache via Apple's `MTLBinaryArchive`. When the
-    // process opens a Metal device for the first time, ggml-metal
-    // JITs every compute pipeline state object (PSO) from MSL source
-    // — that's the ~30–60 s "cold start" tax visible on every
-    // CrispASR / CrisperWeaver process spawn. The archive lets us
-    // serialise the compiled PSOs to disk on shutdown and reload
-    // them on the next launch, so the second+ run skips the JIT
-    // entirely for any shape the first run already touched.
-    //
-    // Storage layout: one `.archive` file per device, keyed by the
-    // device's user-visible name (spaces normalised to underscores).
-    // Default path is `~/Library/Caches/ggml-metal/<device>.archive`;
-    // override with `GGML_METAL_PIPELINE_CACHE`. Set
-    // `GGML_METAL_PIPELINE_CACHE_DISABLE=1` to skip the cache (e.g.
-    // when chasing a stale-PSO bug).
+    // CrispASR: persistent PSO cache, one archive per Metal device.
     id<MTLBinaryArchive> binary_archive;
     NSURL * binary_archive_url;
-    bool binary_archive_dirty; // true when we added at least one PSO since the last serialise
+    bool binary_archive_dirty;
 };
+
+static NSURL * crispasr_metal_pipeline_cache_url(NSString * device_name) {
+    NSFileManager * fm = [NSFileManager defaultManager];
+    NSURL * dir = nil;
+    const char * override = getenv("GGML_METAL_PIPELINE_CACHE");
+    if (override && override[0]) {
+        dir = [NSURL fileURLWithPath:[NSString stringWithUTF8String:override]];
+    } else {
+        NSURL * caches = [fm URLForDirectory:NSCachesDirectory inDomain:NSUserDomainMask
+                            appropriateForURL:nil create:YES error:nil];
+        if (caches) {
+            dir = [caches URLByAppendingPathComponent:@"ggml-metal" isDirectory:YES];
+        }
+    }
+    if (!dir || ![fm createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil]) {
+        return nil;
+    }
+    NSMutableCharacterSet * unsafe = [NSMutableCharacterSet whitespaceCharacterSet];
+    [unsafe addCharactersInString:@"/\\:*?\"|<>"];
+    NSString * leaf = [[device_name componentsSeparatedByCharactersInSet:unsafe] componentsJoinedByString:@"_"];
+    return [dir URLByAppendingPathComponent:[leaf stringByAppendingString:@".archive"]];
+}
+
+static void crispasr_metal_pipeline_cache_open(ggml_metal_device_t dev) {
+    if (getenv("GGML_METAL_PIPELINE_CACHE_DISABLE")) {
+        return;
+    }
+    if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+        NSURL * url = crispasr_metal_pipeline_cache_url([dev->mtl_device name]);
+        if (!url) {
+            return;
+        }
+        MTLBinaryArchiveDescriptor * desc = [MTLBinaryArchiveDescriptor new];
+        const BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:[url path]];
+        if (exists) {
+            desc.url = url;
+        }
+        NSError * error = nil;
+        id<MTLBinaryArchive> archive = [dev->mtl_device newBinaryArchiveWithDescriptor:desc error:&error];
+        [desc release];
+        if (!archive && exists) {
+            [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+            MTLBinaryArchiveDescriptor * fresh = [MTLBinaryArchiveDescriptor new];
+            archive = [dev->mtl_device newBinaryArchiveWithDescriptor:fresh error:&error];
+            [fresh release];
+        }
+        if (!archive) {
+            GGML_LOG_WARN("%s: pipeline cache unavailable: %s\n", __func__,
+                    error ? [[error description] UTF8String] : "unknown error");
+            return;
+        }
+        dev->binary_archive = archive;
+        dev->binary_archive_url = [url retain];
+        GGML_LOG_INFO("%s: pipeline cache %s: %s\n", __func__, exists ? "loaded" : "created",
+                [[url path] UTF8String]);
+    }
+}
+
+static void crispasr_metal_pipeline_cache_flush(ggml_metal_device_t dev) {
+    if (!dev->binary_archive || !dev->binary_archive_url || !dev->binary_archive_dirty) {
+        return;
+    }
+    NSError * error = nil;
+    if (![dev->binary_archive serializeToURL:dev->binary_archive_url error:&error]) {
+        GGML_LOG_WARN("%s: failed to serialize pipeline cache: %s\n", __func__,
+                error ? [[error description] UTF8String] : "unknown error");
+    }
+}
+
+static id<MTLBinaryArchive> crispasr_metal_device_archive(ggml_metal_device_t dev) {
+    return dev ? dev->binary_archive : nil;
+}
+
+static void crispasr_metal_device_mark_archive_dirty(ggml_metal_device_t dev) {
+    if (dev) {
+        dev->binary_archive_dirty = true;
+    }
+}
 
 //
 // MTLResidenceSet wrapper
@@ -1076,27 +1133,11 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
         return;
     }
 
-    // CrispASR patch: warn instead of abort when resources outlive teardown.
-    //
-    // Upstream asserts here because a non-empty residency set means a buffer
-    // was not freed before the device went away. That is a fair diagnostic for
-    // an application, but this is a LIBRARY: ggml_metal_device_get holds the
-    // device in a function-local static, so this runs during static
-    // destruction, and any FFI consumer that keeps a session alive until
-    // process exit -- an entirely normal pattern for a long-lived Dart/Python
-    // handle -- got SIGABRT plus a backtrace AFTER all its output was already
-    // correct. Reported by a downstream consumer against v0.8.17.
-    //
-    // Releasing the array is still correct refcounting: any residency set a
-    // live buffer still references stays alive by its own retain. So warn,
-    // then proceed. Same posture as 1dc4cb93 (gguf: reject empty keys instead
-    // of asserting) -- a malformed/late state should degrade, not abort a
-    // process that has already done its work.
+    // FFI consumers commonly let sessions live until process teardown. Report
+    // late Metal resources without aborting after successful inference.
     const NSUInteger n_alive = [rsets->data count];
     if (n_alive != 0) {
-        GGML_LOG_WARN("%s: %lu Metal residency set(s) still alive at device teardown - "
-                      "a buffer or context was not freed before exit. Continuing; "
-                      "free your contexts/sessions explicitly to silence this.\n",
+        GGML_LOG_WARN("%s: %lu Metal residency set(s) still alive at device teardown\n",
                       __func__, (unsigned long) n_alive);
     }
 
@@ -1111,161 +1152,34 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
     free(rsets);
 }
 
-// ───────────────────────────────────────────────────────────────────
-// CrispASR patch (PLAN #88 / CrisperWeaver §5.18): MTLBinaryArchive
-// helpers for the persistent pipeline cache. Free functions kept
-// file-static so they don't appear in the public ggml-metal ABI.
-// ───────────────────────────────────────────────────────────────────
-
-// Resolve the on-disk path for this device's pipeline archive.
-// `GGML_METAL_PIPELINE_CACHE` (a directory) overrides the default
-// `~/Library/Caches/ggml-metal/`. The leaf filename is the device's
-// `name` property with spaces normalised to underscores. Returns nil
-// when path resolution failed entirely.
-static NSURL * crispasr_metal_pipeline_cache_url(NSString * device_name) {
-    NSFileManager * fm = [NSFileManager defaultManager];
-
-    NSURL * cache_dir = nil;
-    const char * env_dir = getenv("GGML_METAL_PIPELINE_CACHE");
-    if (env_dir && env_dir[0] != '\0') {
-        cache_dir = [NSURL fileURLWithPath:[NSString stringWithUTF8String:env_dir]];
-    } else {
-        NSURL * libcache = [fm URLForDirectory:NSCachesDirectory
-                                     inDomain:NSUserDomainMask
-                            appropriateForURL:nil
-                                       create:YES
-                                        error:nil];
-        if (!libcache) {
-            return nil;
-        }
-        cache_dir = [libcache URLByAppendingPathComponent:@"ggml-metal" isDirectory:YES];
-    }
-
-    // Ensure the directory exists; first run will create it.
-    NSError * mkdir_err = nil;
-    if (![fm createDirectoryAtURL:cache_dir
-      withIntermediateDirectories:YES
-                       attributes:nil
-                            error:&mkdir_err]) {
-        GGML_LOG_WARN("%s: pipeline-cache dir %s unwritable (%s) — caching disabled\n",
-                __func__,
-                [[cache_dir path] UTF8String],
-                mkdir_err ? [[mkdir_err description] UTF8String] : "unknown");
-        return nil;
-    }
-
-    // Normalise the device name so it's a safe filename: lowercase
-    // spaces and ` / \ : * ? " | < >` are all replaced with `_`.
-    NSMutableCharacterSet * unsafe = [NSMutableCharacterSet whitespaceCharacterSet];
-    [unsafe addCharactersInString:@"/\\:*?\"|<>"];
-    NSArray<NSString *> * parts = [device_name componentsSeparatedByCharactersInSet:unsafe];
-    NSString * safe = [parts componentsJoinedByString:@"_"];
-    if (safe.length == 0) {
-        safe = @"unknown-device";
-    }
-
-    NSString * filename = [NSString stringWithFormat:@"%@.archive", safe];
-    return [cache_dir URLByAppendingPathComponent:filename];
-}
-
-// Create or load the device's binary archive. On the first run
-// (or after a delete) the file doesn't exist yet and we hand
-// `MTLBinaryArchiveDescriptor` a nil URL — Metal returns a fresh,
-// empty archive we'll fill in as pipelines compile. On subsequent
-// runs the existing file gets mapped in; pipelines whose function
-// hash is already serialised inside get loaded straight from disk.
-//
-// Sets `dev->binary_archive` + `dev->binary_archive_url`. Both stay
-// nil when caching is disabled, the cache file is corrupt (load
-// failed), or the device doesn't support binary archives.
-static void crispasr_metal_pipeline_cache_open(ggml_metal_device_t dev) {
-    // MTLBinaryArchive + the descriptor-attached pipeline-creation
-    // form both require macOS 11.0 / iOS 14.0 / tvOS 14.0. Older
-    // systems silently skip caching (the rest of the code already
-    // handles `dev->binary_archive == nil` gracefully by falling
-    // back to the historical newComputePipelineStateWithFunction
-    // path inside the descriptor — Metal accepts a nil
-    // binaryArchives array).
-    if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
-        // continue
-    } else {
-        return;
-    }
-
-    const char * disable = getenv("GGML_METAL_PIPELINE_CACHE_DISABLE");
-    if (disable && disable[0] != '\0' && disable[0] != '0') {
-        GGML_LOG_INFO("%s: GGML_METAL_PIPELINE_CACHE_DISABLE set — skipping pipeline cache\n", __func__);
-        return;
-    }
-
-    NSURL * url = crispasr_metal_pipeline_cache_url([dev->mtl_device name]);
-    if (!url) {
-        return;
-    }
-
-    MTLBinaryArchiveDescriptor * desc = [MTLBinaryArchiveDescriptor new];
-    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:[url path]];
-    if (exists) {
-        desc.url = url;
-    } // else nil → fresh archive
-
-    NSError * err = nil;
-    id<MTLBinaryArchive> archive = [dev->mtl_device newBinaryArchiveWithDescriptor:desc error:&err];
-    [desc release];
-
-    if (!archive) {
-        // Failure is non-fatal — caching is purely a perf optimisation.
-        // The most common cause is a stale archive from a different
-        // ggml-metal build (kernel hashes changed); delete-and-retry
-        // with a fresh archive.
-        if (exists) {
-            GGML_LOG_WARN("%s: cached archive %s rejected by Metal (%s) — discarding and starting fresh\n",
-                    __func__,
-                    [[url path] UTF8String],
-                    err ? [[err description] UTF8String] : "unknown");
-            [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
-            err = nil;
-            MTLBinaryArchiveDescriptor * fresh = [MTLBinaryArchiveDescriptor new];
-            archive = [dev->mtl_device newBinaryArchiveWithDescriptor:fresh error:&err];
-            [fresh release];
-        }
-        if (!archive) {
-            GGML_LOG_WARN("%s: pipeline-cache init failed (%s) — caching disabled\n",
-                    __func__,
-                    err ? [[err description] UTF8String] : "unknown");
-            return;
-        }
-    }
-
-    dev->binary_archive = archive;        // retained by newBinary...
-    dev->binary_archive_url = [url retain];
-    dev->binary_archive_dirty = false;
-    GGML_LOG_INFO("%s: pipeline cache %s — %s\n",
-            __func__,
-            exists ? "loaded" : "created",
-            [[url path] UTF8String]);
-}
-
-// Flush the in-memory archive to disk. Called from
-// `ggml_metal_device_free`. No-op when caching is disabled or
-// nothing was added since the last serialise.
-static void crispasr_metal_pipeline_cache_flush(ggml_metal_device_t dev) {
-    if (!dev->binary_archive || !dev->binary_archive_url || !dev->binary_archive_dirty) {
-        return;
-    }
-    NSError * err = nil;
-    if ([dev->binary_archive serializeToURL:dev->binary_archive_url error:&err]) {
-        GGML_LOG_INFO("%s: pipeline cache serialised → %s\n",
-                __func__,
-                [[dev->binary_archive_url path] UTF8String]);
-        dev->binary_archive_dirty = false;
-    } else {
-        GGML_LOG_WARN("%s: pipeline cache serialise failed for %s (%s)\n",
-                __func__,
-                [[dev->binary_archive_url path] UTF8String],
-                err ? [[err description] UTF8String] : "unknown");
-    }
-}
+static const struct {
+    const char *              name;
+    const char *              token;
+    enum ggml_metal_device_id id;
+} k_metal_devices[] = {
+#define DEV(name, id) { name, #id, id }
+    DEV("M1",       GGML_METAL_DEVICE_M1),
+    DEV("M1 Pro",   GGML_METAL_DEVICE_M1_PRO),
+    DEV("M1 Max",   GGML_METAL_DEVICE_M1_MAX),
+    DEV("M1 Ultra", GGML_METAL_DEVICE_M1_ULTRA),
+    DEV("M2",       GGML_METAL_DEVICE_M2),
+    DEV("M2 Pro",   GGML_METAL_DEVICE_M2_PRO),
+    DEV("M2 Max",   GGML_METAL_DEVICE_M2_MAX),
+    DEV("M2 Ultra", GGML_METAL_DEVICE_M2_ULTRA),
+    DEV("M3",       GGML_METAL_DEVICE_M3),
+    DEV("M3 Pro",   GGML_METAL_DEVICE_M3_PRO),
+    DEV("M3 Max",   GGML_METAL_DEVICE_M3_MAX),
+    DEV("M3 Ultra", GGML_METAL_DEVICE_M3_ULTRA),
+    DEV("M4",       GGML_METAL_DEVICE_M4),
+    DEV("M4 Pro",   GGML_METAL_DEVICE_M4_PRO),
+    DEV("M4 Max",   GGML_METAL_DEVICE_M4_MAX),
+    DEV("M5",       GGML_METAL_DEVICE_M5),
+    DEV("M5 Pro",   GGML_METAL_DEVICE_M5_PRO),
+    DEV("M5 Max",   GGML_METAL_DEVICE_M5_MAX),
+    DEV("M5 Ultra", GGML_METAL_DEVICE_M5_ULTRA),
+    DEV("A18 Pro",  GGML_METAL_DEVICE_A18_PRO),
+#undef DEV
+};
 
 static enum ggml_metal_device_id ggml_metal_device_id_parse(const char * name) {
     if (!name) {
@@ -1310,15 +1224,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
                 }
 
-            // CrispASR patch (PLAN #88 / CrisperWeaver §5.18): open the
-            // pipeline cache before any PSO gets JIT'd — including the
-            // tensor-API-probe dummy_kernel further down. Cache hits
-            // skip the Metal shader compiler entirely; misses fall
-            // through to JIT and get added to the archive on the way
-            // out, so the next run starts warm.
-            crispasr_metal_pipeline_cache_open(dev);
-
-            dev->addr_virt = 0x000000400ULL;
+                dev->addr_virt = 0x000000400ULL;
 
                 dev->props.device = device;
 
@@ -1498,6 +1404,8 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     snprintf(dev->props.desc, sizeof(dev->props.desc), "%s", gpu_name);
                 }
 
+                crispasr_metal_pipeline_cache_open(dev);
+
                 dev->library = ggml_metal_library_init(dev);
                 if (!dev->library) {
                     GGML_LOG_ERROR("%s: error: failed to create library\n", __func__);
@@ -1562,22 +1470,14 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
 void ggml_metal_device_free(ggml_metal_device_t dev) {
     assert(dev != NULL);
 
-    // CrispASR patch (PLAN #88 / CrisperWeaver §5.18): flush the
-    // binary archive BEFORE the library + device go away. Once
-    // `mtl_device` is released we can't talk to the archive any
-    // more. The flush is a no-op when nothing was added since the
-    // last serialise — typical for read-only "warm" runs.
-    crispasr_metal_pipeline_cache_flush(dev);
-    if (dev->binary_archive) {
-        [dev->binary_archive release];
-        dev->binary_archive = nil;
-    }
-    if (dev->binary_archive_url) {
-        [dev->binary_archive_url release];
-        dev->binary_archive_url = nil;
-    }
+    @autoreleasepool {
+        ggml_metal_rsets_free(dev->rsets);
 
-    ggml_metal_rsets_free(dev->rsets);
+        crispasr_metal_pipeline_cache_flush(dev);
+        [dev->binary_archive release];
+        [dev->binary_archive_url release];
+        dev->binary_archive = nil;
+        dev->binary_archive_url = nil;
 
         ggml_metal_library_free(dev->library);
         dev->library = NULL;
@@ -1602,21 +1502,6 @@ void * ggml_metal_device_get_obj(ggml_metal_device_t dev) {
 
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev) {
     return dev->mtl_queue;
-}
-
-// CrispASR patch (PLAN #88 / CrisperWeaver §5.18): the pipeline-
-// cache accessors. Kept file-static + forward-declared near the
-// top of this file so the library-compile path (above the struct
-// definition) can read/write the archive without seeing the
-// internals.
-static id<MTLBinaryArchive> crispasr_metal_device_archive(ggml_metal_device_t dev) {
-    return dev ? dev->binary_archive : nil;
-}
-
-static void crispasr_metal_device_mark_archive_dirty(ggml_metal_device_t dev) {
-    if (dev) {
-        dev->binary_archive_dirty = true;
-    }
 }
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
@@ -1869,16 +1754,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_REPEAT:
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;
-        // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
         case GGML_OP_AA_SNAKE_BETA:
             return op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 &&
                    op->src[3]->type == GGML_TYPE_F32 &&
                    op->src[4]->type == GGML_TYPE_F32 &&
-                   op->type        == GGML_TYPE_F32 &&
-                   ggml_is_contiguous(op->src[0]) &&
-                   ggml_is_contiguous(op);
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         case GGML_OP_CONV_TRANSPOSE_2D:
             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                 (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
@@ -1955,20 +1838,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_FLASH_ATTN_EXT:
-            // CrispASR patch (#83): if the op carries PREC_F32, refuse to
-            // run it on Metal — Apple's FA kernel uses simdgroup_half8x8
-            // tiles for Q×K^T regardless of K type, leaking ~1e-4 drift vs
-            // CPU's full-F32 attention. Returning false routes the op to
-            // the CPU backend via the scheduler. Used by chatterbox T3
-            // (which sets PREC_F32 on every flash_attn_ext) so that the
-            // attention output is bit-identical CPU/GPU when paired with
-            // kernel_mul_mv_q4_K_q8_K. Other backends ignore PREC_F32 by
-            // design (it's only meaningful in this scope).
-            {
-                const enum ggml_prec fa_prec = (enum ggml_prec) ggml_get_op_params_i32(op, 3);
-                if (fa_prec == GGML_PREC_F32) {
-                    return false;
-                }
+            // Metal FA uses half tiles even when the caller requests F32.
+            if ((enum ggml_prec) ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
+                return false;
             }
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&
@@ -2090,26 +1962,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     has_simdgroup_reduction, op, true,
                     ggml_metal_op_mul_mat_use_mm(op, has_simdgroup_mm));
         case GGML_OP_MUL_MAT_ID:
-            // This is an allow-all-but-a-few check, so any weight type WITHOUT a
-            // Metal matmul kernel is claimed as supported, scheduled onto Metal,
-            // and then fails hard when the pipeline lookup misses:
-            //
-            //   failed to compile pipeline: base = 'kernel_mul_mm_tq2_0_f32'
-            //   Function kernel_mul_mm_tq2_0_f32 was not found in the library
-            //
-            // A TQ2_0 model (BitNet/ternary — vibevoice-asr-bitnet) therefore
-            // produced an EMPTY transcript on Metal while transcribing correctly
-            // on CPU. Declaring the type unsupported lets the scheduler fall back
-            // instead, which is slower but correct.
-            //
-            // TQ1_0/TQ2_0 are the only *weight* types missing here: the other
-            // gaps are CPU-only repacks (Q4_0_4_4 and friends, produced by repack
-            // on CPU so they never reach this backend), removed types (Q4_2/Q4_3)
-            // or activation-side types (Q8_1/Q8_K) that are not a matmul src0.
             if (op->src[0]->type == GGML_TYPE_TQ1_0 || op->src[0]->type == GGML_TYPE_TQ2_0) {
                 return false;
             }
-            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
+            return ggml_metal_supports_mul_mat_op(
+                    has_simdgroup_reduction, op, false,
+                    ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm));
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
@@ -2579,18 +2437,11 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     if (buf->is_shared && !getenv("CRISPASR_FORCE_BLIT_COPY")) {
         memcpy((char *) tensor->data + offset, data, size);
-        // CrispASR debug (#83 r9 follow-up #5): probe CPU/GPU cache coherency
-        // hypothesis. CRISPASR_FORCE_DMB=1 inserts a full memory barrier
-        // after the host memcpy so the GPU is guaranteed to observe the
-        // writes when the subsequent Metal command buffer executes.
         if (getenv("CRISPASR_FORCE_DMB")) {
             __sync_synchronize();
         }
         return;
     }
-    // CrispASR debug (#83 r9 follow-up #5): if CRISPASR_FORCE_BLIT_COPY=1,
-    // use the blit-encoder path even for shared-mode buffers, so the GPU
-    // executes a copy command that the next compute submission waits on.
 
     @autoreleasepool {
         // src

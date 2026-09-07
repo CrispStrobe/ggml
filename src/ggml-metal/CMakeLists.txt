@@ -46,7 +46,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/solve_tri.metal
     kernels/rope.metal
     kernels/conv.metal
-    kernels/aa-snake-beta.metal
+    kernels/aa_snake_beta.metal
     kernels/upscale.metal
     kernels/argsort.metal
     kernels/pool.metal

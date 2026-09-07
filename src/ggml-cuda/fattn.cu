@@ -666,22 +666,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
-    // Use the WMMA kernel if possible:
-    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 512 && Q->ne[0] != 576) {
-        if (can_use_vector_kernel && Q->ne[1] <= 2) {
-#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
-            if (!mask_is_per_head)
-#endif
-            return BEST_FATTN_KERNEL_VEC;
-        }
-#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK
-        // WMMA-F16 doesn't yet consume per-head mask strides; fall through to
-        // NONE (CPU fallback) via the safety net at the end of this function.
-        if (!mask_is_per_head)
-#endif
-        return BEST_FATTN_KERNEL_WMMA_F16;
-    }
-
     // AMD MFMA needs a certain minimum batch size to outscale the tile kernel for large head sizes.
     if ((amd_mfma_available(cc) && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if ((Q->ne[0] <= 64 && Q->ne[1] * gqa_ratio_eff > 8)) {

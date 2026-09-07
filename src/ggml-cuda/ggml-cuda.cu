@@ -14,7 +14,6 @@
 #include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/concat.cuh"
 #include "ggml-cuda/conv-transpose-1d.cuh"
-#include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
@@ -2640,21 +2639,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
             }
-        }
-
-        // [TAG_GET_ROWS_CUDA_GRAPHS]
-        // GET_ROWS on a k-quant source (e.g. quantized token-embedding lookup)
-        // routes through get_rows_cuda_kquant, which copies the index tensor
-        // D2H and calls cudaStreamSynchronize to read it on the host before
-        // launching per-row dequant kernels (see getrows.cu). A host sync is
-        // illegal inside cudaStreamBeginCapture/EndCapture, so any graph
-        // containing such an op must not be captured. Legacy (Q4_0 etc.) and
-        // F16/F32 GET_ROWS use the capture-safe k_get_rows path and are fine.
-        if (node->op == GGML_OP_GET_ROWS && node->src[0] && ggml_is_quantized(node->src[0]->type)) {
-            use_cuda_graph = false;
-#ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to quantized GET_ROWS\n", __func__);
-#endif
         }
 
         if (!use_cuda_graph) {

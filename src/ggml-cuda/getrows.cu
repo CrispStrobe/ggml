@@ -2,70 +2,6 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
-// ── k-quant GET_ROWS ────────────────────────────────────────────────
-// The legacy quants (Q4_0 etc.) use a per-element dequantize_kernel_t
-// that outputs float2. K-quants (Q4_K, Q5_K, Q6_K) have a more complex
-// block structure incompatible with that interface. Instead, we use the
-// row-level dequantize functions from convert.cu via ggml_get_to_fp32_cuda.
-//
-// Strategy: copy indices to host, then launch one dequantize kernel per
-// selected row. For typical embedding lookups (1-4 rows of 4096 elements),
-// sequential kernel launches are negligible vs the LM forward pass.
-//
-// The (i10, i11, i12) indexing below deliberately mirrors k_get_rows_float:
-//   i01      = src1[i10*s10 + i11*s11 + i12*s12]
-//   dst row  = dst  + i10*nb1  + i11*nb2  + i12*nb3
-//   src0 row = src0 + i01*nb01 + i11*nb02 + i12*nb03
-// An earlier version of this patch flattened everything to a single linear
-// index and ignored nb02/nb03/nb2/nb3, which is only correct when
-// ne11 == ne12 == 1. That holds for embedding lookups — the case it was
-// written for — but produces wrong rows for any BROADCAST get_rows, which
-// upstream now supports and covers in test-backend-ops
-// (GET_ROWS(type=q*_K,...,be1=7): ERR ~1.75 on a P100).
-template<typename dst_t>
-static void get_rows_cuda_kquant(
-        const void * src0_d, const ggml_type src0_type, const int32_t * src1_d, dst_t * dst_d,
-        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
-        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
-        const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
-    to_fp32_cuda_t dequant = ggml_get_to_fp32_cuda(src0_type);
-    GGML_ASSERT(dequant != nullptr);
-
-    // src1 strides are in BYTES here (the float launchers divide them down);
-    // convert to element strides to index the host copy.
-    const size_t s10 = nb10 / sizeof(int32_t);
-    const size_t s11 = nb11 / sizeof(int32_t);
-    const size_t s12 = nb12 / sizeof(int32_t);
-
-    // Copy the index tensor to host. Size it from the strides, not from
-    // ne10*ne11*ne12 — with broadcasting the addressed span is larger than the
-    // element count, and the old code under-copied.
-    const int64_t n_ids = ne10 * ne11 * ne12;
-    const size_t span = (ne10 > 0 && ne11 > 0 && ne12 > 0)
-        ? (size_t)((ne10 - 1)*s10 + (ne11 - 1)*s11 + (ne12 - 1)*s12) + 1
-        : 0;
-    if (span == 0) {
-        return;
-    }
-    std::vector<int32_t> ids_host(span);
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), src1_d, span * sizeof(int32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    GGML_UNUSED(n_ids);
-
-    for (int64_t i12 = 0; i12 < ne12; i12++) {
-        for (int64_t i11 = 0; i11 < ne11; i11++) {
-            for (int64_t i10 = 0; i10 < ne10; i10++) {
-                const int32_t i01 = ids_host[i10*s10 + i11*s11 + i12*s12];
-                const void * src_row = (const char *) src0_d + (size_t) i01*nb01 + (size_t) i11*nb02 + (size_t) i12*nb03;
-                float * dst_row = (float *) ((char *) dst_d + (size_t) i10*nb1 + (size_t) i11*nb2 + (size_t) i12*nb3);
-                dequant(src_row, dst_row, ne00, stream);
-            }
-        }
-    }
-}
-
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -469,15 +405,6 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         default:
-            // k-quants and any other type with a to_fp32 dequantize path.
-            // Only available when dst_t is float (k-quant dequant always outputs F32).
-            if constexpr (std::is_same_v<dst_t, float>) {
-                if (ggml_get_to_fp32_cuda(src0_type) != nullptr) {
-                    get_rows_cuda_kquant(src0_d, src0_type, src1_d, dst_d,
-                        ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-                    break;
-                }
-            }
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
             break;
     }
