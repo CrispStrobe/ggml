@@ -67,9 +67,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let elems = (params.ne0 + WG_SIZE - 1) / WG_SIZE;
 
     var sum = 0.0f;
-#ifdef NORM
-    var sum_lin = 0.0f;
-#endif
     var col = lid.x;
     for (var j: u32 = 0; j < elems; j++) {
         if (col >= params.ne0) {
@@ -85,18 +82,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     }
 
     scratch[lid.x] = sum;
-#ifdef NORM
-    scratch2[lid.x] = sum_lin;
-#endif
     workgroupBarrier();
 
     var offset: u32 = WG_SIZE / 2u;
     while (offset > 0) {
         if (lid.x < offset) {
             scratch[lid.x] += scratch[lid.x + offset];
-#ifdef NORM
-            scratch2[lid.x] += scratch2[lid.x + offset];
-#endif
         }
         offset /= 2u;
         workgroupBarrier();
@@ -133,16 +124,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let scale = 1.0 / sqrt(variance + params.eps);
 #elif defined(RMS_NORM)
     let scale = 1.0/sqrt(sum/f32(params.ne0) + params.eps);
-    let shift = 0.0f;
 #elif defined(L2_NORM)
     let scale = 1.0/max(sqrt(sum), params.eps);
-    let shift = 0.0f;
-#elif defined(NORM)
-    // LayerNorm: (x - mean) / sqrt(var + eps); var = E[x^2] - mean^2
-    let mean = scratch2[0] / f32(params.ne0);
-    let variance = sum / f32(params.ne0) - mean * mean;
-    let scale = 1.0/sqrt(variance + params.eps);
-    let shift = -mean;
 #endif
 
 #ifdef NORM
