@@ -58,3 +58,9 @@
 # Upstream links the CUDA::cuda_driver imported target unconditionally for the
 # VMM pool; it is not always defined (Kaggle, nvidia/cuda devel containers).
 1	src/ggml-cuda/CMakeLists.txt	GGML_CUDA_DRIVER_LIB
+
+# --- WebGPU ops still absent upstream v0.23 -------------------------------
+1	src/ggml-webgpu/wgsl-shaders/arange.wgsl	fn main
+1	src/ggml-webgpu/wgsl-shaders/pool2d.wgsl	fn main
+1	src/ggml-webgpu/wgsl-shaders/conv_transpose_2d.wgsl	fn main
+1	src/ggml-webgpu/ggml-webgpu.cpp	get_conv_transpose_2d_pipeline
