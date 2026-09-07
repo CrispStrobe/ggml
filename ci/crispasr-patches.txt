@@ -38,6 +38,7 @@
 
 # --- Metal ----------------------------------------------------------------
 1	src/ggml-metal/kernels/aa_snake_beta.metal	aa_snake_beta
+1	src/ggml-metal/kernels/conv.metal	kernel_im2col_flat
 1	src/ggml-metal/ggml-metal-ops.cpp	aa_snake_beta
 1	src/ggml-metal/ggml-metal-device.cpp	aa_snake_beta
 1	src/ggml-metal/ggml-metal-device.m	crispasr_metal_pipeline_cache
