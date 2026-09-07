@@ -10676,6 +10676,10 @@ void ggml_compute_forward_glu(
             {
                 ggml_compute_forward_geglu_quick(params, dst);
             } break;
+        case GGML_GLU_OP_SWIGLU_CLAMP:
+            {
+                ggml_compute_forward_swiglu_clamp(params, dst);
+            } break;
         case GGML_GLU_OP_SIGLU:
             {
                 ggml_compute_forward_siglu(params, dst);
