@@ -40,7 +40,10 @@ layout (push_constant) uniform parameter {
     uint32_t ne3;
 
     uint32_t neq2;
-    uint32_t neq3;
+    // Mask row stride in elements (mask->nb[1] / sizeof(f16)). This slot was
+    // neq3, which always equals ne3 (the result's ne3 is q->ne[3]); the struct
+    // is at the 128-byte push-constant limit, so the stride reuses it.
+    uint32_t nbm1;
     uint32_t nek2;
     uint32_t nek3;
     uint32_t nev2;
@@ -184,10 +187,10 @@ void init_indices()
 
     // broadcast factors
     rk2 = p.neq2/p.nek2;
-    rk3 = p.neq3/p.nek3;
+    rk3 = p.ne3/p.nek3;
 
     rv2 = p.neq2/p.nev2;
-    rv3 = p.neq3/p.nev3;
+    rv3 = p.ne3/p.nev3;
 
     // k indices
     ik3 = iq3 / rk3;
@@ -207,7 +210,9 @@ void init_indices()
     // "p.gqa_ratio >> 16" is just a roundabout way of writing zero
     // that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
-    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+    // Otherwise a row is the mask's real stride: a mask wider than KV (padded,
+    // or shared across K/V lengths) is legal and the CPU/CUDA backends honour it.
+    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : p.nbm1;
 }
 
 // Bias applied to softmax to stay in fp16 range.

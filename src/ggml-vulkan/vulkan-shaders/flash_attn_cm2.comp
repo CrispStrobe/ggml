@@ -238,13 +238,13 @@ void main() {
         coopMatPerElementNV(slopeMat, slopeMat, perElemOpComputeSlope, iq2);
     }
 
-    const uint32_t mo_stride = CEIL_DIV(KV, 16 * Bc);
+    const uint32_t mo_stride = CEIL_DIV(p.nbm1, 16 * Bc); // the mask_opt table is nem0 (= nbm1) wide
     // mo_offset will point to the tile starting at row i*Br and col 0
     uint32_t mo_offset = mo_stride * i;
 
-    uint32_t m_offset = gqa_iq1*KV * 2 /*sizeof(float16_t)*/;
+    uint32_t m_offset = gqa_iq1*p.nbm1 * 2 /*sizeof(float16_t)*/;
     if (p.nem2 != 1 || p.nem3 != 1) {
-        m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV * 2 /*sizeof(float16_t)*/;
+        m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * p.nbm1 * 2 /*sizeof(float16_t)*/;
         mo_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * CEIL_DIV(p.nem1, Br) * mo_stride;
     }
 

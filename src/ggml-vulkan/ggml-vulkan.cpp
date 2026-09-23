@@ -1394,7 +1394,7 @@ struct vk_flash_attn_push_constants {
     uint32_t ne3;
 
     uint32_t neq2;
-    uint32_t neq3;
+    uint32_t nbm1; // mask row stride in elements; was neq3 (== ne3), see flash_attn_base.glsl
     uint32_t nek2;
     uint32_t nek3;
     uint32_t nev2;
@@ -11041,9 +11041,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     const uint32_t alignment = tuning_params.block_cols;
+    // The mask is read with its own row stride (it may be wider than KV).
+    const uint32_t nbm1 = mask ? (uint32_t)(mask->nb[1] / ggml_type_size(mask->type)) : KV;
     bool aligned = (KV % alignment) == 0 &&
                    // the "aligned" shader variant will forcibly align strides, for performance
-                   (q_stride & 7) == 0 && (k_stride & 7) == 0 && (v_stride & 7) == 0;
+                   (q_stride & 7) == 0 && (k_stride & 7) == 0 && (v_stride & 7) == 0 && (nbm1 & 7) == 0;
 
     // Need to use the coopmat2 variant that clamps loads when HSK/HSV aren't sufficiently aligned.
     if (((HSK | HSV) % 16) != 0 && tuning_params.path == FA_COOPMAT2) {
@@ -11222,7 +11224,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     const vk_flash_attn_push_constants pc = { N, KV,
                                               (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3,
-                                              (uint32_t)neq2, (uint32_t)neq3,
+                                              (uint32_t)neq2, nbm1,
                                               (uint32_t)nek2, (uint32_t)nek3,
                                               (uint32_t)nev2, (uint32_t)nev3,
                                               nem1, nem2, nem3,

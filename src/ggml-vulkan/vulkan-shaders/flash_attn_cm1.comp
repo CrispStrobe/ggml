@@ -132,16 +132,16 @@ void main() {
         }
     }
 
-    const uint32_t mo_stride = CEIL_DIV(KV, 16 * Bc);
+    const uint32_t mo_stride = CEIL_DIV(p.nbm1, 16 * Bc); // the mask_opt table is nem0 (= nbm1) wide
     // mo_offset will point to the tile starting at row i*Br and col 0
     uint32_t mo_offset = mo_stride * i;
 
     // FaBlockBytesK/V == 2 for f16 (sizeof f16) and == 16 for f32 (vec4) and == ggml block size for quants.
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FaBlockBytesK;
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / FaBlockBytesV;
-    uint32_t m_offset = gqa_iq1*KV;
+    uint32_t m_offset = gqa_iq1*p.nbm1;
     if (p.nem2 != 1 || p.nem3 != 1) {
-        m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
+        m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * p.nbm1;
         mo_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * CEIL_DIV(p.nem1, Br) * mo_stride;
     }
 
