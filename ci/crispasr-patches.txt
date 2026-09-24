@@ -64,3 +64,11 @@
 1	src/ggml-webgpu/wgsl-shaders/pool2d.wgsl	fn main
 1	src/ggml-webgpu/wgsl-shaders/conv_transpose_2d.wgsl	fn main
 1	src/ggml-webgpu/ggml-webgpu.cpp	get_conv_transpose_2d_pipeline
+
+# --- Vulkan flash-attention mask row stride (CrispASR#337) ---------------
+# FA shaders read the mask with its own row stride (nbm1, in the old neq3
+# push-constant slot) instead of KV; upstream still uses KV. Guarded by the
+# mask_pad FLASH_ATTN_EXT cases in tests/test-backend-ops.cpp.
+1	src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl	: p.nbm1;
+1	src/ggml-vulkan/ggml-vulkan.cpp	(nbm1 & 7) == 0
+1	tests/test-backend-ops.cpp	mask_pad

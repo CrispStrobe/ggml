@@ -90,10 +90,20 @@ jobs:
           cmake --build build -j$(nproc)
       # lavapipe is a software Vulkan device, so the kernels actually execute on
       # a hosted runner — a compile-only check would miss miscomputes.
+      # Until 2026-09 this step tested ONLY the CPU backend ("Backend 1/1: CPU"):
+      # the ICD path it named (lvp_icd.x86_64.json) does not exist in this Mesa
+      # (lvp_icd.json), and ggml skips CPU-type Vulkan devices unless
+      # GGML_VK_VISIBLE_DEVICES selects one. Discover the ICD, force the device,
+      # and fail if Vulkan0 was not in the run.
       - name: test-backend-ops (lavapipe)
         env:
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-        run: ./build/bin/test-backend-ops
+          GGML_VK_VISIBLE_DEVICES: "0"
+        run: |
+          export VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)
+          ./build/bin/test-backend-ops -b Vulkan0 2>&1 | tee tbo.log
+          rc=${PIPESTATUS[0]}
+          grep -q "Backend .*: Vulkan0" tbo.log || { echo "::error::Vulkan0 was not tested"; exit 1; }
+          exit $rc
 
   cuda:
     name: cuda (compile)
