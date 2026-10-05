@@ -988,10 +988,12 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
  */
 static bool is_matmul_weight(const ggml_tensor * tensor) {
     std::string                                  name = ggml_get_name(tensor);
-    static const std::unordered_set<std::string> weight_suffixes{ "output.weight",      "attn_q.weight",
-                                                                  "attn_k.weight",      "attn_v.weight",
-                                                                  "attn_output.weight", "ffn_gate.weight",
-                                                                  "ffn_up.weight",      "ffn_down.weight" };
+    static const std::unordered_set<std::string> weight_suffixes{
+        "output.weight",      "attn_q.weight",      "attn_k.weight",      "attn_v.weight",
+        "attn_output.weight", "ffn_gate.weight",    "ffn_up.weight",      "ffn_down.weight",
+        "attn.q.weight",      "attn.k.weight",      "attn.v.weight",      "attn.o.weight",
+        "ffn.gate.weight",    "ffn.up.weight",      "ffn.down.weight",    "lm_head.weight",
+    };
 
     for (const auto & suffix : weight_suffixes) {
         if (name.find(suffix) != std::string::npos) {
