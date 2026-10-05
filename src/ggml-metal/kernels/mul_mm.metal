@@ -359,6 +359,208 @@ kernel void kernel_mul_mm(
 
 #endif // GGML_METAL_HAS_TENSOR
 
+// CrispASR patch (#83): high-precision mul_mm variant — keeps F32 inputs in
+// shared memory (no F16 round-to-half cast on B), so the simdgroup matmul
+// runs F32 × F32 → F32 instead of half × half → F32. Selected via the
+// existing GGML_PREC_F32 op_param flag in mul_mm dispatch when the result
+// would otherwise drift past chatterbox's multinomial-sampler tolerance
+// (LEARNINGS §"Root cause located — ggml-metal kernel_mul_mm legacy path").
+//
+// Layout differences vs the legacy kernel above:
+//   - sa: 64*32*sizeof(float) = 8192 bytes  (vs 4096 with half)
+//   - sb: 32*32*sizeof(float) = 4096 bytes  (vs 2048 with half)
+//   - total shmem: 12288 bytes  (vs 6144 with half)
+//   - operand simdgroup tiles are simdgroup_float8x8 (S0_8x8 = S1_8x8 = float)
+template<
+    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &),
+    typename T0, typename T0_4x4>
+kernel void kernel_mul_mm_hp(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    // F32 layout: sa is 8192 bytes (64*32*sizeof(float)).
+    threadgroup float * sa = (threadgroup float *)(shmem);
+    threadgroup float * sb = (threadgroup float *)(shmem + 8192);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    short il = il0;
+
+    const int i12 = im%args.ne12;
+    const int i13 = im/args.ne12;
+
+    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    const short    offset1 = il0/nl;
+
+    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const float * y = (device const float *)(src1
+        + args.nb13*i13
+        + args.nb12*i12
+        + args.nb11*(r1 + lr1)
+        + args.nb10*iy);
+
+    simdgroup_float8x8 ma[4];
+    simdgroup_float8x8 mb[2];
+
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++){
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // load A: dequantise weight block into a F32 tile in shmem
+        if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+
+                *(sa + 64*ib + 8*ly + lx) = loop_k + 16*il + i < args.ne00 ? (float) *((device T0 *) x + i) : 0.0f;
+            }
+        } else {
+            float4x4 temp_a;
+            dequantize_func(x, il, temp_a);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            FOR_UNROLL (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+                const short lx = (tiitg/NL0)%8;
+                const short ly = i%8;
+                const short ib = 8*sx + sy;
+
+                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+            }
+        }
+
+        // load B: copy F32 input into F32 shmem (no F16 round)
+        if (FC_mul_mm_bc_inp) {
+            for (short i = 0; i < 8; ++i) {
+                const short sx = (tiitg%NL1);
+                const short sy = (tiitg/NL1)/8;
+                const short lx = i;
+                const short ly = (tiitg/NL1)%8;
+                const short ib = 4*sx + sy;
+
+                *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? *((device float *) y + i) : 0.0f;
+            }
+        } else {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            const short ly = (tiitg/NL1)%8;
+            const short ib = 4*sx + sy;
+
+            *(threadgroup float2x4 *)(sb + 64*ib + 8*ly) = *((device float2x4 *) y);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const float * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const float * lsmb = (sb + 2*64*(sgitg/2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            // F32 × F32 → F32 simdgroup MAC (the whole point of this kernel).
+            FOR_UNROLL (short i = 0; i < 8; i++){
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+        device float * C = (device float *) dst +
+            (r0 + 32*(sgitg &  1)) +
+            (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device float4 * D4 = (device float4 *) D;
+
+                threadgroup float  * C  = temp_str + (j*NR0);
+                threadgroup float4 * C4 = (threadgroup float4 *) C;
+
+                int i = 0;
+                for (; i < nr0/4; i++) {
+                    *(D4 + i) = *(C4 + i);
+                }
+
+                i *= 4;
+                for (; i < nr0; i++) {
+                    *(D + i) = *(C + i);
+                }
+            }
+        }
+    }
+}
+
 template<short ne20> // n_expert_used
 kernel void kernel_mul_mm_id_map0(
         constant ggml_metal_kargs_mul_mm_id_map0 & args,
@@ -790,6 +992,23 @@ template [[host_name("kernel_mul_mm_iq1_m_f16")]]   kernel mul_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_iq4_nl_f16")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_iq4_xs_f16")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_tq2_0_f16")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  half, half2x4>;
+
+// CrispASR patch (#83): high-precision (F32-tile) mul_mm instantiations.
+// Selected at dispatch time when the op carries the GGML_PREC_F32 hint.
+// Names are kernel_mul_mm_<weight>_f32_hp; pipeline lookup in
+// ggml_metal_library_get_pipeline_mul_mm appends "_hp" to the base name
+// when prec == GGML_PREC_F32. Only the chatterbox-relevant weight quant
+// set is wired up below — other PREC_F32 callers fall through to the
+// half-tile kernel with a one-shot warning.
+typedef decltype(kernel_mul_mm_hp<float4x4, 1, dequantize_f32, float, float4x4>) mul_mm_hp_t;
+
+template [[host_name("kernel_mul_mm_f32_f32_hp")]]  kernel mul_mm_hp_t kernel_mul_mm_hp<float4x4,   1,     dequantize_f32,  float, float4x4>;
+template [[host_name("kernel_mul_mm_f16_f32_hp")]]  kernel mul_mm_hp_t kernel_mul_mm_hp<half4x4,    1,     dequantize_f16,  half,  half4x4>;
+template [[host_name("kernel_mul_mm_q4_K_f32_hp")]] kernel mul_mm_hp_t kernel_mul_mm_hp<block_q4_K, QK_NL, dequantize_q4_K, float, float4x4>;
+template [[host_name("kernel_mul_mm_q5_K_f32_hp")]] kernel mul_mm_hp_t kernel_mul_mm_hp<block_q5_K, QK_NL, dequantize_q5_K, float, float4x4>;
+template [[host_name("kernel_mul_mm_q6_K_f32_hp")]] kernel mul_mm_hp_t kernel_mul_mm_hp<block_q6_K, QK_NL, dequantize_q6_K, float, float4x4>;
+template [[host_name("kernel_mul_mm_q8_0_f32_hp")]] kernel mul_mm_hp_t kernel_mul_mm_hp<block_q8_0, 2,     dequantize_q8_0, float, float4x4>;
+
 
 //
 // indirect matrix-matrix multiplication
