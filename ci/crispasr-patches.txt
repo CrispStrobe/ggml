@@ -62,6 +62,11 @@
 # --- Vulkan ---------------------------------------------------------------
 1	src/ggml-vulkan/ggml-vulkan.cpp	conv_transpose_1d_f16
 1	src/ggml-vulkan/ggml-vulkan.cpp	pipeline_snake_f32
+# Upstream split the device struct and the push-constant blocks out of
+# ggml-vulkan.cpp (v0.26: ggml-vulkan-types.h, ggml-vulkan-push-constants.h).
+# The carried members live there now, where a merge takes "theirs" silently.
+1	src/ggml-vulkan/ggml-vulkan-types.h	pipeline_conv_transpose_1d_f16
+1	src/ggml-vulkan/ggml-vulkan-types.h	pipeline_siglu
 
 # --- CUDA -----------------------------------------------------------------
 # The long-grid IM2COL fix is upstream-owned as of v0.23.
@@ -85,4 +90,22 @@
 # mask_pad FLASH_ATTN_EXT cases in tests/test-backend-ops.cpp.
 1	src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl	: p.nbm1;
 1	src/ggml-vulkan/ggml-vulkan.cpp	(nbm1 & 7) == 0
+# The C++ half of the push-constant block (must stay in the same slot as the
+# GLSL one above) moved to ggml-vulkan-push-constants.h in the v0.26 split.
+1	src/ggml-vulkan/ggml-vulkan-push-constants.h	uint32_t nbm1; // mask row stride
 1	tests/test-backend-ops.cpp	mask_pad
+
+# --- SIGLU: a GLU variant we add to the ordered ggml_glu_op enum ----------
+1	include/ggml.h	GGML_GLU_OP_SIGLU
+1	src/ggml.c	GGML_GLU_OP_COUNT == 8
+1	src/ggml-cpu/ops.cpp	ggml_compute_forward_siglu
+
+# --- scheduler: src-rewire mutation log (restore on exit, re-apply on replay)
+# split_graph rewires node->src[j] to per-backend input copies. We record every
+# rewire, restore the user's graph on EVERY exit of compute_splits (3 call
+# sites, plus 1 in drop = 4) and re-apply it on a repeat compute of the same
+# allocation. Upstream has neither; a new early return in compute_splits that
+# skips the restore would not show up here, so re-read that function on a sync.
+4	src/ggml-backend.cpp	ggml_backend_sched_restore_src_mutations(sched);
+1	src/ggml-backend.cpp	ggml_backend_sched_apply_src_mutations(sched);
+1	src/ggml-backend.cpp	ggml_backend_sched_drop_src_mutations(sched);
