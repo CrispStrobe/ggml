@@ -3126,6 +3126,59 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
+// [starling] Tiny-op serialization. A single-token decode graph is mostly
+// small elementwise nodes (casts, adds, norms over one row), and each one ends
+// in a full-pool barrier that costs more than the op itself. Runs of
+// consecutive tiny nodes execute on thread 0 alone with no barrier in
+// between; the other threads go straight to the barrier that ends the run.
+// Only row/element-independent ops without internal barriers qualify, so the
+// results are bit-identical to the threaded split. GGML_CPU_TINY_OP_MAX sets
+// the element limit (default 4096; 0 disables). Initialized in ggml_cpu_init().
+static int64_t ggml_cpu_tiny_op_max = 4096;
+
+static bool ggml_cpu_node_is_tiny(const struct ggml_cgraph * cgraph, int node_n) {
+    const struct ggml_tensor * node = cgraph->nodes[node_n];
+    if (ggml_nelements(node) > ggml_cpu_tiny_op_max) {
+        return false;
+    }
+    switch (node->op) {
+        case GGML_OP_DUP:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SCALE:
+        case GGML_OP_CONCAT:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_UNARY:
+        case GGML_OP_GLU:
+        case GGML_OP_NORM:
+        case GGML_OP_CLAMP:
+            return true;
+        case GGML_OP_RMS_NORM: {
+            // keep the RMS_NORM + MUL fusion on its threaded path
+            const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+            return ggml_cpu_disable_fusion || !ggml_can_fuse(cgraph, node_n, fuse_ops, 2);
+        }
+        default:
+            return false;
+    }
+}
+
+// next node the compute loop will execute after node_n, or -1
+static int ggml_cpu_next_compute_node(const struct ggml_cgraph * cgraph, int node_n) {
+    for (int i = node_n + 1; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (!ggml_op_is_empty(node->op) && (node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3200,6 +3253,22 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        // [starling] tiny-op serialization (see ggml_cpu_node_is_tiny)
+        const bool tiny = params.nth > 1 && ggml_cpu_tiny_op_max > 0 && !cplan->use_ref &&
+                          ggml_cpu_node_is_tiny(cgraph, node_n);
+        if (tiny) {
+            if (state->ith == 0) {
+                struct ggml_compute_params solo = params;
+                solo.nth = 1;
+                ggml_compute_forward(&solo, node);
+            }
+            const int next = ggml_cpu_next_compute_node(cgraph, node_n);
+            if (next >= 0 && ggml_cpu_node_is_tiny(cgraph, next)) {
+                // the run continues on thread 0: no barrier
+                node_n = next - 1;
+                continue;
+            }
+        } else {
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3207,6 +3276,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -4023,6 +4093,12 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+        {
+            const char * env = getenv("GGML_CPU_TINY_OP_MAX");
+            if (env != NULL) {
+                ggml_cpu_tiny_op_max = atoll(env);
+            }
         }
 
         is_first_call = false;
