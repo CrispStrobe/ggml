@@ -2443,6 +2443,12 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             break;
         case GGML_OP_MUL_MAT:
             {
+#ifdef ASCEND_310P
+                // 310P Cube rejects BF16 activations as well as BF16 weights.
+                if (op->src[1]->type == GGML_TYPE_BF16) {
+                    return false;
+                }
+#endif
                 switch (op->src[0]->type) {
 #ifndef ASCEND_310P
                     case GGML_TYPE_BF16:
@@ -2591,6 +2597,15 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 // value of paddingW should be at most half of kernelW
                 return (p0 <= (k0 / 2)) && (p1 <= (k1 / 2));
             }
+        case GGML_OP_ADD:
+#ifdef ASCEND_310P
+            // aclnnAdd on 310P does not accept BF16; allow scheduler fallback.
+            if (op->type == GGML_TYPE_BF16 || op->src[0]->type == GGML_TYPE_BF16 ||
+                op->src[1]->type == GGML_TYPE_BF16) {
+                return false;
+            }
+#endif
+            return true;
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_L2_NORM:
@@ -2605,7 +2620,6 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_NORM:
-        case GGML_OP_ADD:
         case GGML_OP_ADD1:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
