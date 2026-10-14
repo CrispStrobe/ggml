@@ -526,6 +526,8 @@ struct ggml_cann_rope_cache {
     // sin/cos cache, used only to accelerate first layer on each device
     void *  sin_cache                  = nullptr;
     void *  cos_cache                  = nullptr;
+    // Allocated bytes are independent of the last operation's dimensions.
+    size_t sin_cos_cache_bytes = 0;
     // Properties to check before reusing the sincos cache
     int64_t theta_scale_length         = 0;
     int64_t position_length            = 0;

@@ -2818,19 +2818,17 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
 
     // Step5: calculate sin cos.
     // init sin_repeat && cos_repeat, only to accelerate first layer on each device
-    if (position_length > ctx.rope_cache.position_length) {
-        ctx.rope_cache.position_length = position_length;
+    const size_t sin_cos_bytes = theta_scale_length * position_length * 2 * sizeof(float);
+    if (sin_cos_bytes > ctx.rope_cache.sin_cos_cache_bytes) {
         if (ctx.rope_cache.sin_cache != nullptr) {
             ACL_CHECK(aclrtFree(ctx.rope_cache.sin_cache));
         }
         if (ctx.rope_cache.cos_cache != nullptr) {
             ACL_CHECK(aclrtFree(ctx.rope_cache.cos_cache));
         }
-        int64_t repeat_theta_length = theta_scale_length * position_length * 2;
-        ACL_CHECK(
-            aclrtMalloc(&ctx.rope_cache.sin_cache, repeat_theta_length * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
-        ACL_CHECK(
-            aclrtMalloc(&ctx.rope_cache.cos_cache, repeat_theta_length * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMalloc(&ctx.rope_cache.sin_cache, sin_cos_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMalloc(&ctx.rope_cache.cos_cache, sin_cos_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+        ctx.rope_cache.sin_cos_cache_bytes = sin_cos_bytes;
     }
 
     // sin/cos
