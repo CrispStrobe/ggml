@@ -979,27 +979,20 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
 /**
  * @brief   Check whether a tensor is a weight tensor for matrix multiplication.
  *
- * @details Checks whether the given tensor serves as weight parameters in matrix multiplication operations,
- *          typically within neural network layers. The function maintains a static set of canonical weight
- *          naming suffixes from Transformer-based architectures. Uses substring matching to identify weight
- *          tensors even with hierarchical naming patterns.
+ * @details Compatibility recognition uses bounded suffixes. Explicit General
+ *          usage vetoes repacking; expanded recognition is limited to the new
+ *          optional cache, whose ordinary tensor storage remains ND.
  *
  * @param tensor Pointer to the target ggml_tensor object (const-qualified).
  */
-static bool is_matmul_weight(const ggml_tensor * tensor) {
-    std::string                                  name = ggml_get_name(tensor);
-    static const std::unordered_set<std::string> weight_suffixes{ "output.weight",      "attn_q.weight",
-                                                                  "attn_k.weight",      "attn_v.weight",
-                                                                  "attn_output.weight", "ffn_gate.weight",
-                                                                  "ffn_up.weight",      "ffn_down.weight" };
-
-    for (const auto & suffix : weight_suffixes) {
-        if (name.find(suffix) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
+// The in-place legacy path is retained for A/B. New coverage uses the opt-in
+// cache and does not change ordinary tensor bytes.
+#include "weight_layout.h"
+static bool is_matmul_weight(const ggml_tensor* tensor) {
+    return ggml_cann_legacy_matmul_weight(tensor);
 }
+bool ggml_cann_nz_cache_enabled();
+void* ggml_cann_cached_nz_weight(ggml_backend_cann_context& ctx, const ggml_tensor* weight);
 
 /**
  * @brief Applies a element-wise operation to two input tensors using the CANN

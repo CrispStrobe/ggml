@@ -566,6 +566,7 @@ struct ggml_backend_cann_context {
     /// Cached CANN ACL graph used for executing the current ggml computation graph.
     ggml_cann_graph_lru_cache graph_lru_cache;
     bool                      acl_graph_mode = true;
+    uint64_t nz_cache_epoch = 0;
 #endif
     bool                   async_mode;
     // Rope Cache
