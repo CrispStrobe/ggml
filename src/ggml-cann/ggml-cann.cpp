@@ -1284,6 +1284,12 @@ static void weight_format_to_nz(ggml_tensor * tensor, int device) {
     void * g_nz_workspace = g_nz_workspaces[device].get();
 
     ACL_CHECK(aclnnTransMatmulWeight(g_nz_workspace, workspaceSize, executor, nullptr));
+    // The cache will be consumed on a compute stream (possibly captured),
+    // while conversion runs on the default stream. Publish readiness only
+    // after conversion completes, and keep its workspace locked until then.
+    if (ggml_cann_nz_cache_enabled()) {
+        ACL_CHECK(aclrtSynchronizeDevice());
+    }
 }
 
 // Serialize chunk uploads and merge byte ranges: overlapping/out-of-order writes
