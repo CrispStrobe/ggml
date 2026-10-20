@@ -801,6 +801,7 @@ struct ggml_cann_nz_cache {
     size_t size = 0;
     bool ready = false;
     bool initialized = false;
+    uint64_t selections = 0; // Host matmul encodes selecting this NZ pointer, not device executions.
     ggml_type type = GGML_TYPE_F32;
     int64_t ne0 = 0, ne1 = 0;
     ggml_cann_upload_coverage written;
@@ -1300,6 +1301,8 @@ static bool ggml_cann_set_cached_weight(ggml_backend_cann_buffer_context* ctx, g
     static const bool enabled = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
     if (!ggml_cann_nz_cache_enabled() || !enabled || !ggml_cann_nz_candidate(tensor))
         return false;
+    if (size == 0)
+        return true;
     std::lock_guard<std::mutex> lock(ctx->nz_mutex);
     auto& entry = ctx->nz[tensor->data];
     if (!entry || entry->type != tensor->type || entry->ne0 != tensor->ne[0] || entry->ne1 != tensor->ne[1]) {
@@ -1357,10 +1360,12 @@ void* ggml_cann_cached_nz_weight(ggml_backend_cann_context& ctx, const ggml_tens
     auto it = buffer->nz.find(weight->data);
     if (it == buffer->nz.end())
         return nullptr;
-    const auto& cache = *it->second;
-    return cache.ready && cache.type == weight->type && cache.ne0 == weight->ne[0] && cache.ne1 == weight->ne[1]
-               ? cache.data
-               : nullptr;
+    auto& cache = *it->second;
+    if (cache.ready && cache.type == weight->type && cache.ne0 == weight->ne[0] && cache.ne1 == weight->ne[1]) {
+        ++cache.selections;
+        return cache.data;
+    }
+    return nullptr;
 }
 
 static size_t ggml_cann_nz_cache_size(const ggml_tensor* weight) {
@@ -1376,8 +1381,29 @@ static size_t ggml_cann_nz_cache_size(const ggml_tensor* weight) {
     return c.ready && c.type == weight->type && c.ne0 == weight->ne[0] && c.ne1 == weight->ne[1] ? c.size : 0;
 }
 
+static uint64_t ggml_cann_nz_cache_selections(const ggml_tensor* weight) {
+    if (!ggml_cann_nz_cache_enabled() || weight->view_src || !weight->buffer ||
+        !ggml_backend_buft_is_cann(weight->buffer->buft))
+        return 0;
+    auto* ctx = (ggml_backend_cann_buffer_context*)weight->buffer->context;
+    std::lock_guard<std::mutex> lock(ctx->nz_mutex);
+    auto it = ctx->nz.find(weight->data);
+    if (it == ctx->nz.end())
+        return 0;
+    const auto& c = *it->second;
+    return c.ready && c.type == weight->type && c.ne0 == weight->ne[0] && c.ne1 == weight->ne[1] ? c.selections : 0;
+}
+
+static uint64_t ggml_cann_graph_captures(ggml_backend_t backend) {
+    return ((ggml_backend_cann_context*)backend->context)->acl_captures;
+}
+
+static uint64_t ggml_cann_graph_replays(ggml_backend_t backend) {
+    return ((ggml_backend_cann_context*)backend->context)->acl_replays;
+}
+
 static void ggml_cann_invalidate_nz(ggml_backend_buffer_t buffer, const void* data = nullptr, size_t size = 0) {
-    if (!ggml_cann_nz_cache_enabled() || !buffer || !ggml_backend_buft_is_cann(buffer->buft))
+    if (!ggml_cann_nz_cache_enabled() || !buffer || !ggml_backend_buft_is_cann(buffer->buft) || (data && size == 0))
         return;
     auto* ctx = (ggml_backend_cann_buffer_context*)buffer->context;
     std::lock_guard<std::mutex> lock(ctx->nz_mutex);
@@ -2462,10 +2488,13 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 
         if (cann_graph_capture_required) {  // End CANN graph capture
             ACL_CHECK(aclmdlRICaptureEnd(cann_ctx->stream(), &matched_graph->graph));
+            ++cann_ctx->acl_captures;
         }
 
         // Execute CANN graph
         ACL_CHECK(aclmdlRIExecuteAsync(matched_graph->graph, cann_ctx->stream()));
+        if (!cann_graph_capture_required)
+            ++cann_ctx->acl_replays;
     }
 #endif  // USE_ACL_GRAPH
 }
@@ -3158,6 +3187,12 @@ static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (std::strcmp(name, "ggml_backend_cann_nz_cache_size") == 0)
         return (void*)ggml_cann_nz_cache_size;
+    if (std::strcmp(name, "ggml_backend_cann_nz_cache_selections") == 0)
+        return (void*)ggml_cann_nz_cache_selections;
+    if (std::strcmp(name, "ggml_backend_cann_graph_captures") == 0)
+        return (void*)ggml_cann_graph_captures;
+    if (std::strcmp(name, "ggml_backend_cann_graph_replays") == 0)
+        return (void*)ggml_cann_graph_replays;
     return nullptr;
 }
 

@@ -568,6 +568,9 @@ struct ggml_backend_cann_context {
     bool                      acl_graph_mode = true;
     uint64_t nz_cache_epoch = 0;
 #endif
+    // Always present: builds without ACL graph support report zero.
+    uint64_t acl_captures = 0;
+    uint64_t acl_replays = 0;
     bool                   async_mode;
     // Rope Cache
     ggml_cann_rope_cache   rope_cache;
