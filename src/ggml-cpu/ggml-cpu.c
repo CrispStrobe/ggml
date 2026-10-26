@@ -1257,6 +1257,19 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+// Choose per graph invocation; never mutate the shared type-trait table.
+static ggml_from_float_t ggml_cpu_from_float_for_plan(
+        const struct ggml_compute_params * params, enum ggml_type type) {
+#if defined(__wasm_simd128__)
+    if (params->wasm_q8_0_round && type == GGML_TYPE_Q8_0) {
+        return quantize_row_q8_0_wasm_nearest;
+    }
+#else
+    GGML_UNUSED(params);
+#endif
+    return type_traits_cpu[type].from_float;
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1276,7 +1289,7 @@ void ggml_compute_forward_mul_mat(
     const int nth = params->nth;
 
     enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
-    ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
+    ggml_from_float_t        const from_float           = ggml_cpu_from_float_for_plan(params, vec_dot_type);
     int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
 
     GGML_ASSERT(ne0 == ne01);
@@ -1555,7 +1568,7 @@ static void ggml_compute_forward_mul_mat_id(
     const bool src1_cont = ggml_is_contiguous(src1);
 
     enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
-    ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
+    ggml_from_float_t const from_float      = ggml_cpu_from_float_for_plan(params, vec_dot_type);
 
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -3099,6 +3112,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.wasm_q8_0_round =*/ cplan->wasm_q8_0_round,
     };
 
 #ifdef GGML_USE_OPENMP

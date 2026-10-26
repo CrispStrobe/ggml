@@ -22,6 +22,10 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // Opt-in WASM SIMD Q8_0 nearest-even activation rounding. False preserves
+        // the legacy converter. Snapshotted by backend plans; no effect elsewhere.
+        bool wasm_q8_0_round;
     };
 
     // numa strategies
@@ -137,6 +141,13 @@ extern "C" {
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
+
+    // Configure before graph/plan execution; concurrent setters on the same
+    // backend are unsupported, as for the other CPU backend configuration APIs.
+    // Independent backends retain independent values. Existing plans retain the
+    // value captured when created. Non-WASM backends ignore this setting.
+    GGML_BACKEND_API void ggml_backend_cpu_set_wasm_q8_0_rounding(ggml_backend_t backend_cpu, bool enabled);
+
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 

@@ -27,6 +27,8 @@ struct ggml_compute_params {
 
     // use reference implementation
     bool use_ref;
+
+    bool wasm_q8_0_round;
 };
 
 

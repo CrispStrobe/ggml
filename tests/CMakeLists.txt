@@ -354,3 +354,12 @@ if (NOT GGML_BACKEND_DL)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 endif()
+
+# Explicit, weight-free experimental WASM rounding controls. Never part of a
+# production module or ordinary test build; run on hosted Emscripten only.
+if (EMSCRIPTEN)
+    add_executable(test-wasm-q8-rounding EXCLUDE_FROM_ALL test-wasm-q8-rounding.cpp)
+    target_include_directories(test-wasm-q8-rounding PRIVATE ../src ../src/ggml-cpu)
+    target_compile_options(test-wasm-q8-rounding PRIVATE -msimd128)
+    target_link_libraries(test-wasm-q8-rounding PRIVATE ggml ggml-cpu)
+endif()
