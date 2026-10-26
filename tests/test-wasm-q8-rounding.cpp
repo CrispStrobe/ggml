@@ -47,20 +47,24 @@ static void converter_controls() {
 }
 
 static void backend_controls(enum ggml_type type, bool indirect) {
-    constexpr int width = 384;
-    std::array<float, width> input{}, weight{};
-    input[0] = 127.0f; input[1] = 1.6f; input[2] = -1.6f;
-    input[3] = 2.5f; input[4] = -2.5f;
-    weight[1] = 1.0f;
+    constexpr int width = 32;
+    std::array<float, width> input;
+    input.fill(1.6f); input[0] = 127.0f;
     const size_t row_bytes = ggml_row_size(type, width);
     const int experts = indirect ? 2 : 1;
     std::vector<uint8_t> weights(experts * row_bytes);
+    // Authored constant-one weights: IQ4_NL table index8 is exactly1.
+    // A distinct unused expert has scale2, so wrong expert selection also fails.
     for (int expert = 0; expert < experts; ++expert) {
-        if (expert) weight[1] = -1.0f;
+        const float scale = indirect && expert == 0 ? 2.0f : 1.0f;
         if (type == GGML_TYPE_Q8_0) {
-            quantize_row_q8_0_ref(weight.data(), (block_q8_0 *)(weights.data() + expert * row_bytes), width);
+            block_q8_0 block{}; block.d = ggml_fp32_to_fp16(scale);
+            std::memset(block.qs, 1, sizeof block.qs);
+            std::memcpy(weights.data() + expert * row_bytes, &block, sizeof block);
         } else {
-            quantize_row_iq4_nl_ref(weight.data(), (block_iq4_nl *)(weights.data() + expert * row_bytes), width);
+            block_iq4_nl block{}; block.d = ggml_fp32_to_fp16(scale);
+            std::memset(block.qs, 0x88, sizeof block.qs);
+            std::memcpy(weights.data() + expert * row_bytes, &block, sizeof block);
         }
     }
     std::array<block_q8_0, width / 32> qlegacy{}, qnearest{};
@@ -72,7 +76,7 @@ static void backend_controls(enum ggml_type type, bool indirect) {
     const void * selected_weight = weights.data() + (experts - 1) * row_bytes;
     trait->vec_dot(width, &expected_legacy, 0, selected_weight, 0, qlegacy.data(), 0, 1);
     trait->vec_dot(width, &expected_nearest, 0, selected_weight, 0, qnearest.data(), 0, 1);
-    require(std::fabs(expected_nearest - expected_legacy) > .01f, "control exposes rounding difference");
+    require(expected_legacy == 158.0f && expected_nearest == 189.0f, "authored exact158/189 dot control");
 
     ggml_context * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
     require(ctx != nullptr, "metadata context");
