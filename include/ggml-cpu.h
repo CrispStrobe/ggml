@@ -148,7 +148,6 @@ extern "C" {
     // value captured when created. Non-WASM backends ignore this setting.
     GGML_BACKEND_API void ggml_backend_cpu_set_wasm_q8_0_rounding(ggml_backend_t backend_cpu, bool enabled);
 
-
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);

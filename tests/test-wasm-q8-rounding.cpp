@@ -122,6 +122,7 @@ static void backend_controls(enum ggml_type type, bool indirect) {
 }
 
 int main() {
+    ggml_cpu_init(); // initialize FP16 lookup tables before independent dot controls
     require(ggml_cpu_has_wasm_simd() == 1, "actual WASM SIMD backend");
     converter_controls();
     for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
