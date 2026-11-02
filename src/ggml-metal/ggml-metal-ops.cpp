@@ -2654,6 +2654,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // T3 where mul_mv_ext's F32-input dot product still drifts vs CPU's
     // Q8_K-input integer dot product.
     if (prec_f32 &&
+        ne11 < ne11_mm_min &&
         op->src[0]->type == GGML_TYPE_Q4_K &&
         op->src[1]->type == GGML_TYPE_F32 &&
         ne00 % 256 == 0) {
@@ -2745,6 +2746,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // 396 mul_mats × 10 CFM steps) where mul_mv_ext's F32 accumulator
     // still drifts ~1e-3 vs CPU.
     if (prec_f32 &&
+        ne11 < ne11_mm_min &&
         op->src[0]->type == GGML_TYPE_Q8_0 &&
         op->src[1]->type == GGML_TYPE_F32 &&
         ne00 % 32 == 0) {
@@ -2867,10 +2869,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            false) && (ne11 >= 4 && ne11 <= 8)
          )
          ||
-         // CrispASR patch (#83): force mul_mv_ext for PREC_F32 even at larger
-         // ne11 — F32-precise dot-product accumulator. Kernel instantiations
-         // support r1ptg in {2,3,4,5}; r1ptg=4 is picked below for ne11>8.
-         (prec_f32 && ext_supported && ne11 >= 2)
+         // CrispASR patch (#83): force mul_mv_ext for PREC_F32 for small batch
+         // (ne11 < 8) — F32-precise dot-product accumulator. Larger batches use mul_mm_hp.
+         (prec_f32 && ext_supported && ne11 >= 2 && ne11 < ne11_mm_min)
         )
        ) {
         // TODO: determine the optimal parameters based on grid utilization
@@ -3035,9 +3036,12 @@ size_t ggml_metal_op_mul_mat_extra_q8_K(const ggml_tensor * op) {
     if (prec != GGML_PREC_F32) {
         return 0;
     }
+    const int64_t ne11 = op->src[1]->ne[1];
+    if (ne11 >= 8) {
+        return 0;
+    }
 
     const int64_t nb   = op->src[0]->ne[0] / 256;
-    const int64_t ne11 = op->src[1]->ne[1];
     const int64_t ne12 = op->src[1]->ne[2];
     const int64_t ne13 = op->src[1]->ne[3];
     return (size_t)ne11 * ne12 * ne13 * nb * ggml_type_size(GGML_TYPE_Q8_K);
@@ -3065,9 +3069,12 @@ size_t ggml_metal_op_mul_mat_extra_q8_0(const ggml_tensor * op) {
     if (prec != GGML_PREC_F32) {
         return 0;
     }
+    const int64_t ne11 = op->src[1]->ne[1];
+    if (ne11 >= 8) {
+        return 0;
+    }
 
     const int64_t nb   = op->src[0]->ne[0] / 32;
-    const int64_t ne11 = op->src[1]->ne[1];
     const int64_t ne12 = op->src[1]->ne[2];
     const int64_t ne13 = op->src[1]->ne[3];
     return (size_t)ne11 * ne12 * ne13 * nb * ggml_type_size(GGML_TYPE_Q8_0);

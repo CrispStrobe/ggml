@@ -488,3 +488,55 @@ typedef decltype(kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_t
 template [[host_name("kernel_set_rows_f32_i64_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_tq2_0>;
 template [[host_name("kernel_set_rows_f32_i32_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_K, block_tq2_0, quantize_tq2_0>;
 
+// F32 -> Q8_0 input quantize, mirrors quantize_row_q8_0 (ARM NEON path):
+// 32-elem block, F16 scale, round-to-nearest-even int8 quants. Pre-step
+// for kernel_mul_mv_q8_0_q8_0.
+//
+// One block (32 elements) per simdgroup; one element per thread.
+// dispatch grid: (num_blocks_per_row, ne01_input_rows, ne02 * ne03_batches).
+// dispatch threads: 32 per group.
+[[host_name("kernel_quantize_q8_0_f32")]]
+kernel void kernel_quantize_q8_0_f32(
+        constant ggml_metal_kargs_quantize_q8_0 & args,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiisg [[thread_index_in_simdgroup]]) {
+    constexpr int QK = 32;
+
+    const uint block_idx = tgpig.x;
+    const uint col       = tgpig.y;
+    const uint batch     = tgpig.z;
+
+    const uint64_t src_off = batch * args.nb03 + col * args.nb01
+                           + (uint64_t)block_idx * QK * sizeof(float);
+    device const float * x = (device const float *)(src + src_off);
+
+    const float my_x = x[tiisg];
+    float       my_a = fabs(my_x);
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float oa = simd_shuffle_xor(my_a, offset);
+        if (oa > my_a) my_a = oa;
+    }
+    const float amax = simd_broadcast(my_a, 0);
+
+    // Use ORIGINAL F32 d for id, not F16-rounded -- matches CPU.
+    const float d  = amax / 127.0f;
+    const float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+
+    const uint64_t out_blocks_per_col = (uint64_t)args.num_blocks_per_row;
+    const uint64_t out_off =
+        (((uint64_t)batch * args.ne01 + col) * out_blocks_per_col + block_idx)
+        * sizeof(block_q8_0);
+    device block_q8_0 * out = (device block_q8_0 *)(dst + out_off);
+
+    if (tiisg == 0) {
+        out->d = (half)d;
+    }
+
+    // rint() rounds to nearest integer under default IEEE round-to-nearest-even,
+    // matching ARM NEON vcvtnq_s32_f32.
+    out->qs[tiisg] = (int8_t)rint(my_x * id);
+}
+

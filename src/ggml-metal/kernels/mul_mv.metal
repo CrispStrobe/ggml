@@ -3396,3 +3396,60 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
 template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
 template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
+
+// Q8_0 x Q8_0 mat-vec multiply, F32 output. Mirrors
+// ggml_vec_dot_q8_0_q8_0_generic (ggml-cpu/quants.c) exactly: per 32-elem
+// block, int8 x int8 -> int32 accumulator, then multiply by (x.d_f32 *
+// y.d_f32) and accumulate into F32 sumf. Pure scalar integer arithmetic
+// per output element; no simdgroup matmul. Slow vs the legacy F32-input
+// kernel but bit-identical to CPU.
+//
+// dispatch grid: (ceil(ne01/TG), ne11, ne02*ne03).
+// dispatch threads: 32 per group. row = tgpig.x*32 + tiitg.
+[[host_name("kernel_mul_mv_q8_0_q8_0")]]
+kernel void kernel_mul_mv_q8_0_q8_0(
+        constant ggml_metal_kargs_mul_mv_q8_0_q8_0 & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiitg [[thread_index_in_threadgroup]]) {
+    constexpr int QK = 32;
+    constexpr int TPG = 32;
+
+    const uint row   = tgpig.x * TPG + tiitg;
+    const uint col   = tgpig.y;
+    const uint batch = tgpig.z;
+
+    if ((int)row >= args.ne01) {
+        return;
+    }
+
+    const int nb = args.ne00 / QK;
+
+    const uint i12 = batch % args.ne12;
+    const uint i13 = batch / args.ne12;
+
+    device const block_q8_0 * x = (device const block_q8_0 *)
+        (src0 + (uint64_t)row * args.nb01
+              + (uint64_t)(i12 / args.r2) * args.nb02
+              + (uint64_t)(i13 / args.r3) * args.nb03);
+
+    device const block_q8_0 * y = (device const block_q8_0 *)
+        (src1 + ((uint64_t)batch * args.ne11 + col) * (uint64_t)nb * sizeof(block_q8_0));
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        int sumi = 0;
+        device const int8_t * xq = x[i].qs;
+        device const int8_t * yq = y[i].qs;
+        for (int j = 0; j < QK; ++j) {
+            sumi += (int)xq[j] * (int)yq[j];
+        }
+        sumf += (float)sumi * ((float)x[i].d * (float)y[i].d);
+    }
+
+    device float * dst_f32 = (device float *)dst;
+    dst_f32[(uint64_t)batch * args.ne0 * args.ne1 + (uint64_t)col * args.ne0 + row] = sumf;
+}
