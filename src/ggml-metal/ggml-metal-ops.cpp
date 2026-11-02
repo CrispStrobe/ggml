@@ -2097,6 +2097,13 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // unaffected because they don't tag PREC_F32.
     const enum ggml_prec prec = (enum ggml_prec) ggml_get_op_params_i32(op, 0);
     const bool prec_f32 = (prec == GGML_PREC_F32);
+    // CrispEmbed patch: op_params[1] == GGML_METAL_MUL_MAT_PREC_F32_HP asks for
+    // F32 activations against dequantized-to-F32 weights (no int8 activation
+    // pre-quantization, no half tiles): ne11 == 1 keeps the ordinary F32-input
+    // mul_mv kernels, 2..8 use mul_mv_ext and larger batches the existing
+    // simdgroup_float8x8 kernel_mul_mm_*_hp. This is the arithmetic of a CPU
+    // dequantize-then-F32 matmul rather than of ggml-cpu's quantized vec_dot.
+    const bool prec_hp = prec_f32 && ggml_metal_op_mul_mat_prec_hp(op);
 
     // CrispEmbed patch (OXR/D-FINE Metal, opt-in GGML_METAL_PREC_F32_MM=1, value
     // parsed: unset/""/"0" = off): for PREC_F32 products with more than 8 src1
@@ -2121,7 +2128,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // output (verified by comparing K-projection dump). Used for chatterbox
     // T3 where mul_mv_ext's F32-input dot product still drifts vs CPU's
     // Q8_K-input integer dot product.
-    if (prec_f32 && !prec_f32_mm &&
+    if (prec_f32 && !prec_f32_mm && !prec_hp &&
         op->src[0]->type == GGML_TYPE_Q4_K &&
         op->src[1]->type == GGML_TYPE_F32 &&
         ne00 % 256 == 0) {
@@ -2212,7 +2219,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // Used for chatterbox S3Gen UNet (Q8_0 quantised diffusion decoder,
     // 396 mul_mats × 10 CFM steps) where mul_mv_ext's F32 accumulator
     // still drifts ~1e-3 vs CPU.
-    if (prec_f32 && !prec_f32_mm &&
+    if (prec_f32 && !prec_f32_mm && !prec_hp &&
         op->src[0]->type == GGML_TYPE_Q8_0 &&
         op->src[1]->type == GGML_TYPE_F32 &&
         ne00 % 32 == 0) {
@@ -2338,7 +2345,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
          // CrispASR patch (#83): force mul_mv_ext for PREC_F32 even at larger
          // ne11 — F32-precise dot-product accumulator. Kernel instantiations
          // support r1ptg in {2,3,4,5}; r1ptg=4 is picked below for ne11>8.
-         (prec_f32 && !prec_f32_mm && ext_supported && ne11 >= 2)
+         (prec_f32 && !prec_f32_mm && !prec_hp && ext_supported && ne11 >= 2)
         )
        ) {
         // TODO: determine the optimal parameters based on grid utilization
@@ -2536,6 +2543,10 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
 // (ne11 × ne12 × ne13 × num_blocks_per_row) block_q8_K records past the
 // matmul's dst, accessible via `bid_tmp.offs += ggml_nbytes(op)` at
 // dispatch time.
+bool ggml_metal_op_mul_mat_prec_hp(const ggml_tensor * op) {
+    return op->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(op, 1) == GGML_METAL_MUL_MAT_PREC_F32_HP;
+}
+
 size_t ggml_metal_op_mul_mat_extra_q8_K(const ggml_tensor * op) {
     if (op->op != GGML_OP_MUL_MAT) {
         return 0;
@@ -2550,7 +2561,7 @@ size_t ggml_metal_op_mul_mat_extra_q8_K(const ggml_tensor * op) {
         return 0;
     }
     const enum ggml_prec prec = (enum ggml_prec) ggml_get_op_params_i32(op, 0);
-    if (prec != GGML_PREC_F32) {
+    if (prec != GGML_PREC_F32 || ggml_metal_op_mul_mat_prec_hp(op)) {
         return 0;
     }
 
@@ -2580,7 +2591,7 @@ size_t ggml_metal_op_mul_mat_extra_q8_0(const ggml_tensor * op) {
         return 0;
     }
     const enum ggml_prec prec = (enum ggml_prec) ggml_get_op_params_i32(op, 0);
-    if (prec != GGML_PREC_F32) {
+    if (prec != GGML_PREC_F32 || ggml_metal_op_mul_mat_prec_hp(op)) {
         return 0;
     }
 
