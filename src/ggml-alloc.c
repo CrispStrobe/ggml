@@ -1007,12 +1007,25 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
-            ggml_vbuffer_free(galloc->buffers[i]);
+            // Several backend slots can share this vbuffer. Detach every alias
+            // before freeing it: allocation failure returns before later slots
+            // would otherwise be updated to the replacement buffer.
+            struct vbuffer * old_buffer = galloc->buffers[i];
+            for (int j = 0; j < galloc->n_buffers; j++) {
+                if (galloc->buffers[j] == old_buffer) {
+                    galloc->buffers[j] = NULL;
+                }
+            }
+            ggml_vbuffer_free(old_buffer);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
+                    // The new size assignments above are not backed by buffers.
+                    // Invalidate them so a same-topology retry must reserve again.
+                    galloc->n_nodes = 0;
+                    galloc->n_leafs = 0;
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
                 }
