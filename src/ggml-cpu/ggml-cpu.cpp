@@ -107,6 +107,7 @@ struct ggml_backend_cpu_context {
     void *              abort_callback_data;
 
     bool                use_ref;  // use reference implementation
+    bool                wasm_q8_0_round; // opt-in, backend-local activation rounding
 };
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
@@ -146,6 +147,7 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
+    cpu_plan->cplan.wasm_q8_0_round      = cpu_ctx->wasm_q8_0_round;
 
     return cpu_plan;
 }
@@ -186,6 +188,7 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
+    cplan.wasm_q8_0_round      = cpu_ctx->wasm_q8_0_round;
 
     return ggml_graph_compute(cgraph, &cplan);
 }
@@ -230,6 +233,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
     ctx->use_ref             = false;
+    ctx->wasm_q8_0_round      = false;
 
     ggml_backend_t cpu_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cpu_guid(),
@@ -282,6 +286,12 @@ void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->use_ref = use_ref;
+}
+
+void ggml_backend_cpu_set_wasm_q8_0_rounding(ggml_backend_t backend_cpu, bool enabled) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+    ctx->wasm_q8_0_round = enabled;
 }
 
 // CPU backend - device
@@ -663,6 +673,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_is_numa") == 0) {
         return (void *)ggml_is_numa;
+    }
+    if (strcmp(name, "ggml_backend_cpu_set_wasm_q8_0_rounding") == 0) {
+        return (void *)ggml_backend_cpu_set_wasm_q8_0_rounding;
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
