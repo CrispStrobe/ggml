@@ -28,6 +28,20 @@ struct ggml_backend_blas_context {
 #endif
 };
 
+static void ggml_backend_blas_apply_n_threads(const ggml_backend_blas_context * ctx) {
+#if defined(GGML_BLAS_USE_OPENBLAS)
+    openblas_set_num_threads(ctx->n_threads);
+#elif defined(GGML_BLAS_USE_BLIS)
+    bli_thread_set_num_threads(ctx->n_threads);
+#elif defined(GGML_BLAS_USE_NVPL)
+    nvpl_blas_set_num_threads(ctx->n_threads);
+#elif defined(GGML_BLAS_USE_MKL)
+    mkl_set_num_threads(ctx->n_threads);
+#else
+    GGML_UNUSED(ctx);
+#endif
+}
+
 static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -116,15 +130,7 @@ static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct gg
 #endif
     }
 
-#if defined(GGML_BLAS_USE_OPENBLAS)
-    openblas_set_num_threads(ctx->n_threads);
-#elif defined(GGML_BLAS_USE_BLIS)
-    bli_thread_set_num_threads(ctx->n_threads);
-#elif defined(GGML_BLAS_USE_NVPL)
-    nvpl_blas_set_num_threads(ctx->n_threads);
-#elif defined(GGML_BLAS_USE_MKL)
-    mkl_set_num_threads(ctx->n_threads);
-#endif
+    ggml_backend_blas_apply_n_threads(ctx);
 
     for (int64_t i13 = 0; i13 < ne13; i13++) {
         for (int64_t i12 = 0; i12 < ne12; i12++) {
@@ -204,9 +210,8 @@ static void ggml_backend_blas_out_prod(ggml_backend_blas_context * ctx, struct g
     float * b = (float *) ((char *) src0->data);
     float * c = (float *) ((char *) dst->data);
 
+    ggml_backend_blas_apply_n_threads(ctx);
     cblas_sgemm(CblasRowMajor, transposeA, CblasNoTrans, m, n, k, 1.0, a, lda, b, n, 0.0, c, n);
-
-    GGML_UNUSED(ctx);
 }
 
 // backend interface
