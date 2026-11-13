@@ -1,0 +1,69 @@
+diff a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp	(rejected hunks)
+@@ -11521,49 +11554,67 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 5, 4, 3 }, 4, eps, true));
+             test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 5, 4, 3 }, 4, eps, false));
+         }
+         // row lengths that are not a multiple of 32, for the scalar (33) and float4 (132, 260) paths
+         for (uint32_t n : { 33, 132, 260 }) {
+             for (bool v : { false, true }) {
+                 test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
+                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
++                test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, { n, 5, 4, 3 }, v, eps));
+             }
+         }
+     }
+ 
+     // in-place tests
+     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
++    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, {64, 5, 4, 3}, false, 1e-6f, true));
+     // shapes below exceed the CUDA gridDim.y/gridDim.z limit of 65535 (llama/27901)
+     test_cases.emplace_back(new test_norm        (GGML_TYPE_F32, {4, 1, 65536, 1}, false, 1e-6f));
+     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 65536, 1}, false, 1e-6f, false));
+     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 1, 65536}, false, 1e-6f, false));
+     test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));
+     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
+ 
+     for (uint32_t n : {1, 127, 129, 511, 513, 2816, 4096, 16385}) {
+         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {n, 3, 2, 1}));
+         test_cases.emplace_back(new test_rms_norm_mul_rope({n, 3, 2, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false));
+         test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 3, 2, 1}, 1e-6f, false, false, false, false, true));
+     }
+ 
++    // BF16 x with F32 weights, n > 1 because the NMSE of a single BF16 output is too noisy
++    // the widths cover every CUDA block size, with and without 4-value loads
++    for (uint32_t n : {127, 128, 512, 1024, 2048, 2816, 4096, 8192, 16385}) {
++        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, {n, 3, 2, 1}));
++        test_cases.emplace_back(new test_rms_norm_mul_rope({n, 3, 2, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false, GGML_TYPE_F16, false, true, GGML_TYPE_BF16));
++        test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, {n, 3, 2, 1}, 1e-6f, false, false, false, false, true, GGML_TYPE_F32));
++        // BF16 residual added after the norm (post-norm models, e.g. Gemma)
++        test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, {n, 3, 2, 1}, 1e-6f, false, false, false, false, true, GGML_TYPE_F32, GGML_TYPE_BF16));
++        for (bool multi_add : {false, true}) {
++            test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, {n, 1, 1, 1}, 1e-6f, false, multi_add, false, false, false, GGML_TYPE_F32));
++        }
++    }
++
+     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
+         test_cases.emplace_back(new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
+         for (int mode : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX}) {
+             for (int64_t n : {64, 256, 512, 1024}) {
+                 test_cases.emplace_back(new test_rms_norm_mul_rope({n, 4, 3, 1}, 1e-6f, false, true, true, mode, true, true, set_rows_type));
+             }
+         }
+     }
+ 
+     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {
+         for (uint32_t n : { 64, 1025 }) {
+             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
+             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
++            test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, { n, 5, 4, 3 }, eps, false, false, false, false, false, GGML_TYPE_F32));
++            test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, { n, 5, 4, 3 }, eps, true, false, false, false, false, GGML_TYPE_F32));
++            test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, { n, 5, 4, 3 }, eps, true, false, false, false, false, GGML_TYPE_F32, GGML_TYPE_BF16));
+             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
+             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
+             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+         }
+     }
+     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
+         for (bool multi_add : {false, true}) {

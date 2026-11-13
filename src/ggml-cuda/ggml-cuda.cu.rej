@@ -1,0 +1,24 @@
+diff a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu	(rejected hunks)
+@@ -6519,19 +6523,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 return (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16 || src0_type == GGML_TYPE_BF16) &&
+                     op->type == src0_type &&
+                     ggml_is_contiguous(op->src[0]) &&
+                     ggml_is_contiguous(op);
+             }
+         case GGML_OP_SILU_BACK:
+             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_NORM:
+-        case GGML_OP_RMS_NORM:
+         case GGML_OP_L2_NORM:
+             return ggml_is_contiguous_rows(op->src[0]);
++        case GGML_OP_RMS_NORM:
++            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) && op->type == op->src[0]->type &&
++                   ggml_is_contiguous_rows(op->src[0]);
+         case GGML_OP_RMS_NORM_BACK:
+             return ggml_is_contiguous(op->src[0]);
+         case GGML_OP_NONE:
+         case GGML_OP_RESHAPE:
+         case GGML_OP_VIEW:
+         case GGML_OP_PERMUTE:
+         case GGML_OP_TRANSPOSE:
+         case GGML_OP_ADD_ID:
