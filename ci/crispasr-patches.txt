@@ -75,7 +75,11 @@
 # ggml-vulkan.cpp (v0.26: ggml-vulkan-types.h, ggml-vulkan-push-constants.h).
 # The carried members live there now, where a merge takes "theirs" silently.
 1	src/ggml-vulkan/ggml-vulkan-types.h	pipeline_conv_transpose_1d_f16
-1	src/ggml-vulkan/ggml-vulkan-types.h	pipeline_siglu
+# SIGLU joined upstream's BF16-capable GLU table (llama/32202): shader generated
+# in the GLU loop, pipeline registered with CREATE_GLU, supports_op case label.
+1	src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp	"siglu" /* CrispASR op */
+1	src/ggml-vulkan/ggml-vulkan.cpp	CREATE_GLU(siglu, SIGLU)
+1	src/ggml-vulkan/ggml-vulkan.cpp	case GGML_GLU_OP_SIGLU: // CrispASR op
 
 # --- CUDA -----------------------------------------------------------------
 # The long-grid IM2COL fix is upstream-owned as of v0.23.
