@@ -49,6 +49,7 @@
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
+#include "ggml-cuda/ssm-conv-support.h"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
@@ -5689,8 +5690,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
-            // assumes d_inner % threads == 0
-            return op->src[0]->ne[1] % 128 == 0;
+            return ggml_cuda_ssm_conv_supported(op);
         }
         case GGML_OP_CONT:
             return true;
