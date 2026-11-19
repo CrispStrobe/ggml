@@ -59,6 +59,8 @@ size_t ggml_metal_op_mul_mat_extra_q8_K(const struct ggml_tensor * op);
 // kernel_quantize_q8_0_f32 + kernel_mul_mv_q8_0_q8_0 dispatch path.
 size_t ggml_metal_op_mul_mat_extra_q8_0(const struct ggml_tensor * op);
 
+size_t ggml_metal_op_conv_2d_extra_tmp(const struct ggml_tensor * op);
+
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_acc               (ggml_metal_op_t ctx, int idx);
