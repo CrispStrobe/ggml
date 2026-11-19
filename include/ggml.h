@@ -430,6 +430,7 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_SLEEP,
         // CrispASR patch (PR #07-metal-aa-snake-beta): fused BigVGAN v2
         // anti-aliased SnakeBeta (upsample 2× + sin²(α·x)/β + downsample 2×).
         // MUST RE-APPLY after every ggml bump.
@@ -2650,6 +2651,12 @@ extern "C" {
             ggml_custom_op_t      fun,
             int                   n_tasks,
             void                * userdata);
+
+    // Busy-wait operator for scheduling and backend testing.
+    GGML_API struct ggml_tensor * ggml_sleep(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,   // wait after this tensor has executed, return value is simply a full view of this tensor
+            int32_t               us); // amount of time to wait in microseconds
 
     // loss function
 

@@ -1114,11 +1114,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
 
+    "SLEEP",
     // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
     "AA_SNAKE_BETA",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1231,11 +1232,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
 
+    "sleep(x)",
     // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
     "aa_snake_beta(x, log_a, log_b, usf, dsf)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6368,6 +6370,27 @@ struct ggml_tensor * ggml_custom_inplace(
 
     return result;
 }
+
+// ggml_sleep
+
+// the result aliases a, the op only delays and never touches the data
+struct ggml_tensor * ggml_sleep(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int32_t               us) {
+    GGML_ASSERT(us >= 0);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+    ggml_format_name(result, "%s (sleep)", a->name);
+
+    ggml_set_op_params_i32(result, 0, us);
+
+    result->op     = GGML_OP_SLEEP;
+    result->src[0] = a;
+
+    return result;
+}
+
 // ggml_cross_entropy_loss
 
 struct ggml_tensor * ggml_cross_entropy_loss(
