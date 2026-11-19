@@ -91,8 +91,7 @@
 # VMM pool; it is not always defined (Kaggle, nvidia/cuda devel containers).
 1	src/ggml-cuda/CMakeLists.txt	GGML_CUDA_DRIVER_LIB
 
-# --- WebGPU ops still absent upstream (ARANGE is upstream since 2026-11) ---
-1	src/ggml-webgpu/wgsl-shaders/pool2d.wgsl	fn main
+# --- WebGPU ops still absent upstream (ARANGE, POOL_2D upstream since 2026-11)
 1	src/ggml-webgpu/wgsl-shaders/conv_transpose_2d.wgsl	fn main
 1	src/ggml-webgpu/ggml-webgpu.cpp	get_conv_transpose_2d_pipeline
 
