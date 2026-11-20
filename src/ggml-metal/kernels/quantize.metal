@@ -540,3 +540,97 @@ kernel void kernel_quantize_q8_0_f32(
     out->qs[tiisg] = (int8_t)rint(my_x * id);
 }
 
+
+// CrispASR patch (#83): Q8_K input quantize kernel.
+//
+// Mirrors quantize_row_q8_K_ref in ggml-quants.c exactly. Each threadgroup
+// processes 1 Q8_K block (256 F32 elements) of one input column. 32 threads
+// per group, each handles 8 elements. simd_shuffle_xor reduces to find amax
+// (and the corresponding signed max). Bsums computed via pair-wise simd
+// shuffle (each pair of threads covers one 16-element bsum group).
+//
+// Used as a pre-step for kernel_mul_mv_q4_K_q8_K so GPU mat-vec mul matches
+// CPU's reference (which uses Q8_K-quantised input) bit-for-bit.
+//
+// dispatch grid: (num_blocks_per_row, ne01_input_rows, ne02 * ne03_batches).
+// dispatch threads: 32 per group.
+//
+// dst layout: stride = num_blocks_per_row * sizeof(block_q8_K) per
+// (col, batch) tuple, contiguous along block_idx.
+[[host_name("kernel_quantize_q8_K_f32")]]
+kernel void kernel_quantize_q8_K_f32(
+        constant ggml_metal_kargs_quantize_q8_K & args,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiisg [[thread_index_in_simdgroup]]) {
+    constexpr int QK = 256;
+    constexpr int TPG = 32;
+    constexpr int EPT = QK / TPG;  // 8 elements per thread
+
+    const uint block_idx = tgpig.x;
+    const uint col       = tgpig.y;
+    const uint batch     = tgpig.z;
+
+    // Source pointer: F32 input at column `col`, batch, block `block_idx`.
+    const uint64_t src_off = batch * args.nb03 + col * args.nb01 + (uint64_t)block_idx * QK * sizeof(float);
+    device const float * x = (device const float *)(src + src_off);
+
+    // Each thread reads 8 contiguous elements
+    float my_x[EPT];
+    float my_amax = 0.0f;
+    float my_max  = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < EPT; ++i) {
+        my_x[i] = x[tiisg * EPT + i];
+        float a = fabs(my_x[i]);
+        if (a > my_amax) {
+            my_amax = a;
+            my_max  = my_x[i];
+        }
+    }
+
+    // simd-reduce: find global amax + corresponding signed max.
+    // Tree reduction via shuffle_xor.
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float oa = simd_shuffle_xor(my_amax, offset);
+        float om = simd_shuffle_xor(my_max,  offset);
+        if (oa > my_amax) {
+            my_amax = oa;
+            my_max  = om;
+        }
+    }
+    const float amax = simd_broadcast(my_amax, 0);
+    const float max_v = simd_broadcast(my_max,  0);
+
+    // Mirror CPU's quantize_row_q8_K_ref: iscale = -127.f / max (note sign).
+    const float iscale = (amax > 0.0f) ? (-127.0f / max_v) : 0.0f;
+    const float d      = (amax > 0.0f) ? (1.0f / iscale)   : 0.0f;
+
+    // Output block pointer.
+    const uint64_t out_blocks_per_col = (uint64_t)args.num_blocks_per_row;
+    const uint64_t out_off =
+        (((uint64_t)batch * args.ne01 + col) * out_blocks_per_col + block_idx) * sizeof(block_q8_K);
+    device block_q8_K * out = (device block_q8_K *)(dst + out_off);
+
+    if (tiisg == 0) {
+        out->d = d;
+    }
+
+    // Quantize 8 elements per thread, accumulate partial sum.
+    int total_sum = 0;
+    #pragma unroll
+    for (int i = 0; i < EPT; ++i) {
+        int v = int(round(iscale * my_x[i]));
+        v = min(v, 127);
+        out->qs[tiisg * EPT + i] = (int8_t)v;
+        total_sum += v;
+    }
+
+    // bsums: 16 sums per block, each covers 16 elements. With 8 elements
+    // per thread, two adjacent threads cover one bsum group.
+    int partner_sum = simd_shuffle_xor(total_sum, 1);
+    if ((tiisg & 1) == 0) {
+        out->bsums[tiisg / 2] = (int16_t)(total_sum + partner_sum);
+    }
+}
