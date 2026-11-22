@@ -65,6 +65,10 @@
 1	src/ggml-metal/kernels/mul_mm.metal	host_name("kernel_mul_mm_q5_K_f32_hp")
 1	src/ggml-metal/kernels/mul_mm.metal	host_name("kernel_mul_mm_q6_K_f32_hp")
 1	src/ggml-metal/kernels/mul_mm.metal	host_name("kernel_mul_mm_q8_0_f32_hp")
+# Fused NORM + MUL + ADD with the chain as src[1] (llama/32300) must not run when
+# the other operand shares memory with the fused output (in-place residual ADD):
+# kokoro short-utterance audio was garbled. Still absent upstream.
+1	src/ggml-metal/ggml-metal-fusion.cpp	ggml_metal_fusion_overlap(out, src)
 # NOTE: NORM_AFFINE is deliberately CPU + CUDA only — there is no Metal kernel,
 # so do not add one here expecting it to exist.
 

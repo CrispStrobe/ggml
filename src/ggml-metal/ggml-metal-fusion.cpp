@@ -138,6 +138,23 @@ static bool ggml_metal_fusion_check_norm(
         // MUL/ADD are commutative, the previous node can be either operand
         const ggml_tensor * src = nodes[j]->src[0] == nodes[j - 1] ? nodes[j]->src[1] : nodes[j]->src[0];
 
+        // CrispASR patch: the fused kernel writes the chain's final output while it
+        // still reads each step's other operand, so they must not share memory. A
+        // weight or bias never does, but with the chain as src[1] the other operand
+        // can be a residual that the allocator lets ADD overwrite in place
+        // (kokoro: x + norm(x)*w garbled short-utterance audio after llama/32300).
+        // The output must also keep the chain's shape: with the chain as src[1] the
+        // other operand sets it and could broadcast the norm result.
+        if (!ggml_are_same_shape(nodes[j], nodes[j - 1])) {
+            return false;
+        }
+        if (mode == GGML_METAL_FUSION_FULL) {
+            const ggml_tensor * out = nodes[fusion->ops.size() - 1];
+            if (!out->data || !src->data || ggml_metal_fusion_overlap(out, src)) {
+                return false;
+            }
+        }
+
         // the weight/bias must have the same row width as the norm input
         if (src->ne[0] != nodes[0]->ne[0]) {
             return false;
