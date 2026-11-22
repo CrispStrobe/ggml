@@ -1,11 +1,9 @@
-// arange: dst[i] = start + i*step (f32, contiguous)
-
 @group(0) @binding(0)
 var<storage, read_write> dst: array<f32>;
 
 struct Params {
     ne: u32,
-    offset_dst: u32,   // in elements
+    offset_dst: u32,
     start: f32,
     step: f32,
 };
@@ -14,9 +12,11 @@ struct Params {
 var<uniform> params: Params;
 
 @compute @workgroup_size(WG_SIZE)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.ne) {
+fn main(@builtin(num_workgroups) num_wg: vec3<u32>, @builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + (num_wg.x * u32(WG_SIZE)) * gid.y;
+    if (i >= params.ne) {
         return;
     }
-    dst[params.offset_dst + gid.x] = params.start + f32(gid.x) * params.step;
+
+    dst[params.offset_dst + i] = params.start + params.step * f32(i);
 }

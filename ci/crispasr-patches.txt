@@ -20,17 +20,26 @@
 1	include/ggml.h	GGML_OP_AA_SNAKE_BETA
 1	include/ggml.h	ggml_norm_affine
 1	include/ggml.h	ggml_aa_snake_beta
-2	src/ggml.c	GGML_OP_COUNT == 103
+2	src/ggml.c	GGML_OP_COUNT == 101
 
-# --- issue #38: F16 vec_dot_type = F32 to avoid saturating F32->F16 -------
-# vfmaq_f16 accumulates in an F16 register and overflows at 65504, which turns
-# long F16xF16 dots into +-Inf -> NaN. Upstream has NOT fixed this.
-1	src/ggml-cpu/ggml-cpu.c	ggml_vec_dot_f16_f32
-1	src/ggml-cpu/ggml-cpu.c	issue #38
-1	src/ggml-cpu/vec.h	ggml_vec_dot_f16_f32
-1	src/ggml-cpu/simd-mappings.h	GGML_F32Cx4_FMA
-# the conv im2col patch buffer is mul_mat's src1, so it follows vec_dot_type
-2	src/ggml-cpu/ops.cpp	vec_dot_type
+# --- issue #38 (F16 x F32 dot instead of saturating F32->F16) -------------
+# UPSTREAM since the 2026-11 sync (llama/31854, "switch to F32 src1 in the CPU
+# backend"): F16 traits use vec_dot_type = F32 + ggml_vec_dot_f16_f32 and the
+# conv im2col patches are built in F32. Our copies were dropped in that merge.
+
+# --- ggml_conv_1d: zero-copy N == 1 ----------------------------------------
+# Upstream fixed the batched layout too (2026-11) but always adds permute +
+# cont; we keep the N == 1 reshape-only path (136 of 141 CrispASR call sites).
+1	src/ggml.c	zero-copy N == 1 path
+
+# --- lazy UE4M3 / FP8 E4M3 CPU tables (CrispASR #302) ----------------------
+# Upstream fills them in ggml_cpu_init; that ran newly compiled CPU code during
+# GPU-only startup and crashed an old Xeon. Filled on first NVFP4 / FP8 use.
+1	src/ggml-cpu/ggml-cpu.c	GGML_CPU_EAGER_UE4M3_LUT
+1	src/ggml-cpu/ggml-cpu.c	ggml_table_f32_f8_e4m3[i] = ggml_f8_e4m3_to_fp32(i);
+1	src/ggml-cpu/quants.c	ggml_cpu_ensure_ue4m3_table();
+1	src/ggml-cpu/arch/x86/quants.c	ggml_cpu_ensure_ue4m3_table();
+1	src/ggml-cpu/arch/arm/quants.c	ggml_cpu_ensure_ue4m3_table();
 
 # --- carried CPU / backend ops -------------------------------------------
 1	src/ggml-cpu/ops.h	ggml_compute_forward_norm_affine
@@ -78,8 +87,7 @@
 # VMM pool; it is not always defined (Kaggle, nvidia/cuda devel containers).
 1	src/ggml-cuda/CMakeLists.txt	GGML_CUDA_DRIVER_LIB
 
-# --- WebGPU ops still absent upstream v0.23 -------------------------------
-1	src/ggml-webgpu/wgsl-shaders/arange.wgsl	fn main
+# --- WebGPU ops still absent upstream (ARANGE is upstream since 2026-11) ---
 1	src/ggml-webgpu/wgsl-shaders/pool2d.wgsl	fn main
 1	src/ggml-webgpu/wgsl-shaders/conv_transpose_2d.wgsl	fn main
 1	src/ggml-webgpu/ggml-webgpu.cpp	get_conv_transpose_2d_pipeline
