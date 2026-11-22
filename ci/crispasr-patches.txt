@@ -20,7 +20,7 @@
 1	include/ggml.h	GGML_OP_AA_SNAKE_BETA
 1	include/ggml.h	ggml_norm_affine
 1	include/ggml.h	ggml_aa_snake_beta
-2	src/ggml.c	GGML_OP_COUNT == 102
+2	src/ggml.c	GGML_OP_COUNT == 103
 
 # --- issue #38 (F16 x F32 dot instead of saturating F32->F16) -------------
 # UPSTREAM since the 2026-11 sync (llama/31854, "switch to F32 src1 in the CPU

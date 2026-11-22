@@ -1117,11 +1117,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "SLEEP",
+
+    "SIGMOID_BACK",
     // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
     "AA_SNAKE_BETA",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1235,11 +1237,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "sleep(x)",
+
+    "sigmoid_back(x)",
     // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
     "aa_snake_beta(x, log_a, log_b, usf, dsf)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2868,6 +2872,21 @@ struct ggml_tensor * ggml_silu_back(
     struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
 
     result->op     = GGML_OP_SILU_BACK;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+// ggml_sigmoid_back
+
+struct ggml_tensor * ggml_sigmoid_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    result->op     = GGML_OP_SIGMOID_BACK;
     result->src[0] = a;
     result->src[1] = b;
 
@@ -7336,6 +7355,11 @@ static void ggml_compute_backward(
                 case GGML_UNARY_OP_SILU: {
                     if (src0_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src0));
+                    }
+                } break;
+                case GGML_UNARY_OP_SIGMOID: {
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_sigmoid_back(ctx, grad, src0));
                     }
                 } break;
                 case GGML_UNARY_OP_EXP: {

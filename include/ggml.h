@@ -433,6 +433,8 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_SLEEP,
+        GGML_OP_SIGMOID_BACK,
+
         // CrispASR patch (PR #07-metal-aa-snake-beta): fused BigVGAN v2
         // anti-aliased SnakeBeta (upsample 2× + sin²(α·x)/β + downsample 2×).
         // MUST RE-APPLY after every ggml bump.
@@ -1046,6 +1048,13 @@ extern "C" {
     // a - dy
     // b - x
     GGML_API struct ggml_tensor * ggml_silu_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // a - dy
+    // b - x
+    GGML_API struct ggml_tensor * ggml_sigmoid_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
