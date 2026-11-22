@@ -4258,6 +4258,12 @@ static void ggml_compute_forward_siglu_f16(
     }
 }
 
+static void ggml_compute_forward_siglu_bf16( // CrispASR op
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_glu_bf16_rows<ggml_vec_siglu_bf16>(params, dst);
+}
+
 static void ggml_compute_forward_siglu(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -4272,6 +4278,10 @@ static void ggml_compute_forward_siglu(
         case GGML_TYPE_F16:
             {
                 ggml_compute_forward_siglu_f16(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_siglu_bf16(params, dst);
             } break;
         default:
             {

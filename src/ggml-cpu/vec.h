@@ -1692,6 +1692,13 @@ inline static void ggml_vec_siglu_f16(const int n, ggml_fp16_t * y, const ggml_f
     }
 }
 
+inline static void ggml_vec_siglu_bf16(const int n, ggml_bf16_t * y, const ggml_bf16_t * x, const ggml_bf16_t * g) { // CrispASR op
+    for (int i = 0; i < n; ++i) {
+        const float xi = GGML_BF16_TO_FP32(x[i]);
+        y[i] = GGML_FP32_TO_BF16((1.0f / (1.0f + expf(-xi))) * GGML_BF16_TO_FP32(g[i]));
+    }
+}
+
 inline static void ggml_vec_geglu_quick_bf16(const int n, ggml_bf16_t * y, const ggml_bf16_t * x, const ggml_bf16_t * g) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_FP32_TO_BF16(ggml_gelu_quick_f32(GGML_BF16_TO_FP32(x[i])) * GGML_BF16_TO_FP32(g[i]));
