@@ -422,6 +422,28 @@ void ggml_vec_dot_f16_f32(int n, float * GGML_RESTRICT s, size_t bs, const ggml_
     r = _mm_add_ps(r, _mm_movehl_ps(r, r));
     r = _mm_add_ss(r, _mm_movehdup_ps(r));
     sumf = _mm_cvtss_f32(r);
+#elif defined(__ARM_NEON) && defined(__aarch64__) && !defined(_MSC_VER) // CrispASR patch
+    // x is widened to F32 in-register (FCVTL) and fused into an F32 FMA over 4
+    // independent sums, like the x86 paths above. Since F16 MUL_MAT keeps src1 in
+    // F32 (llama/31854), this is the F16 matmul inner loop on every ARM host;
+    // the chunked convert-then-dot fallback below was 1.7x slower than the old
+    // F16xF16 dot on Neoverse-N2.
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+    for (; i + 16 <= n; i += 16) {
+        const float16x8_t x0 = vld1q_f16((const __fp16 *)(x + i + 0));
+        const float16x8_t x1 = vld1q_f16((const __fp16 *)(x + i + 8));
+        acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(x0)), vld1q_f32(y + i +  0));
+        acc1 = vfmaq_f32(acc1, vcvt_high_f32_f16(x0),          vld1q_f32(y + i +  4));
+        acc2 = vfmaq_f32(acc2, vcvt_f32_f16(vget_low_f16(x1)), vld1q_f32(y + i +  8));
+        acc3 = vfmaq_f32(acc3, vcvt_high_f32_f16(x1),          vld1q_f32(y + i + 12));
+    }
+    for (; i + 4 <= n; i += 4) {
+        acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vld1_f16((const __fp16 *)(x + i))), vld1q_f32(y + i));
+    }
+    sumf = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 #elif defined(GGML_SIMD)
     // convert chunks of x to F32 and reuse the F32 SIMD dot
     // TODO: convert F16 to F32 in-register and fuse the dot (needs a new SIMD macro); also avoid the per-chunk call overhead for tiny k
