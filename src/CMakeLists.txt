@@ -529,8 +529,16 @@ if (GGML_CPU_ALL_VARIANTS)
             ggml_add_cpu_backend_variant(armv8.2_3    DOTPROD FP16_VECTOR_ARITHMETIC SVE)
             ggml_add_cpu_backend_variant(armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8)
             ggml_add_cpu_backend_variant(armv8.6_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2)
-            ggml_add_cpu_backend_variant(armv9.2_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SME)
-            ggml_add_cpu_backend_variant(armv9.2_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2 SME)
+            # CrispASR patch: GCC < 12 (Ubuntu 22.04's default, needed for a glibc
+            # 2.35 floor) rejects -march=armv9.2-a; skip only the SME variants then.
+            include(CheckCCompilerFlag)
+            check_c_compiler_flag("-march=armv9.2-a+dotprod+fp16+sve+i8mm+sve2+sme" GGML_CC_HAS_ARMV9_2_SME)
+            if (GGML_CC_HAS_ARMV9_2_SME)
+                ggml_add_cpu_backend_variant(armv9.2_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SME)
+                ggml_add_cpu_backend_variant(armv9.2_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2 SME)
+            else()
+                message(STATUS "GGML_CPU_ALL_VARIANTS: compiler lacks -march=armv9.2-a+sme, skipping the SME variants")
+            endif()
         elseif (CMAKE_SYSTEM_NAME MATCHES "Android")
             # Android-specific backends with SoC-compatible feature sets
             ggml_add_cpu_backend_variant(android_armv8.0_1)

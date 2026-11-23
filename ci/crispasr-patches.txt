@@ -124,3 +124,15 @@
 4	src/ggml-backend.cpp	ggml_backend_sched_restore_src_mutations(sched);
 1	src/ggml-backend.cpp	ggml_backend_sched_apply_src_mutations(sched);
 1	src/ggml-backend.cpp	ggml_backend_sched_drop_src_mutations(sched);
+
+# --- ARM F16 MUL_MAT speed (2026-11 sync) ----------------------------------
+# llama/31854 routes F16 MUL_MAT through ggml_vec_dot_f16_f32, which upstream
+# vectorises only on x86; without this NEON path F16 matmul on ARM ran 1.7x
+# slower than before the sync (Neoverse-N2). Drop once upstream has one.
+1	src/ggml-cpu/vec.cpp	#elif defined(__ARM_NEON) && defined(__aarch64__) && !defined(_MSC_VER) // CrispASR patch
+
+# --- GGML_CPU_ALL_VARIANTS on GCC 11 (CrispASR #607) ------------------------
+# The Linux arm64 release builds every ARM CPU variant on Ubuntu 22.04 (glibc
+# 2.35 floor); its GCC 11 rejects -march=armv9.2-a, so the SME variants are
+# added only when the compiler accepts them.
+1	src/CMakeLists.txt	GGML_CC_HAS_ARMV9_2_SME
