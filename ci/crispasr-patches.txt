@@ -136,3 +136,9 @@
 # 2.35 floor); its GCC 11 rejects -march=armv9.2-a, so the SME variants are
 # added only when the compiler accepts them.
 1	src/CMakeLists.txt	GGML_CC_HAS_ARMV9_2_SME
+
+# --- nvml.h optional (2026-11 sync) ----------------------------------------
+# Upstream's NVML brand probe includes <nvml.h> but only dlopens NVML. Minimal
+# CUDA installs (redist component sets in CI/release, Windows and Linux) lack
+# the header; fall back to the four declarations it needs.
+1	src/ggml-cuda/ggml-cuda.cu	!__has_include(<nvml.h>)

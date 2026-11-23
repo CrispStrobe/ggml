@@ -100,7 +100,28 @@
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include "ggml-backend-dl.h"
+#if defined(__has_include) && !__has_include(<nvml.h>)
+// CrispASR patch: NVML is only dlopen'd below; its header is needed for these
+// declarations alone. Minimal CUDA installs (the redist component sets most CI
+// and release jobs use, Windows and Linux) do not ship nvml.h, which broke every
+// such build. Values and signatures copied from nvml.h (CUDA 12.4, stable ABI).
+typedef enum nvmlReturn_enum { NVML_SUCCESS = 0, NVML_ERROR_UNKNOWN = 999 } nvmlReturn_t;
+typedef struct nvmlDevice_st * nvmlDevice_t;
+typedef enum nvmlBrandType_enum {
+    NVML_BRAND_UNKNOWN    = 0,
+    NVML_BRAND_QUADRO     = 1,
+    NVML_BRAND_QUADRO_RTX = 12,
+    NVML_BRAND_NVIDIA_RTX = 13,
+} nvmlBrandType_t;
+extern "C" {
+nvmlReturn_t nvmlInit_v2(void);
+nvmlReturn_t nvmlShutdown(void);
+nvmlReturn_t nvmlDeviceGetHandleByPciBusId_v2(const char * pciBusId, nvmlDevice_t * device);
+nvmlReturn_t nvmlDeviceGetBrand(nvmlDevice_t device, nvmlBrandType_t * type);
+}
+#else
 #include <nvml.h>
+#endif
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
