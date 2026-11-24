@@ -677,7 +677,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         cp_async_wait_all();
         __syncthreads();
         flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (V_h2, tile_V, min(nbatch_V2, DV/2), stride_V, k_VKQ_0, k_VKQ_sup, indices);
+            (V_h2, tile_V, (DVp == DV ? nbatch_V2 : min(nbatch_V2, DV/2)), stride_V, k_VKQ_0, k_VKQ_sup, indices);
     } else {
         // the sparse mask values are gathered per element, always load them synchronously
         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
@@ -694,7 +694,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int k0_stop = k0_start + nbatch_K2 < DKQp/2 ? k0_start + nbatch_K2 : DKQp/2;
 
         if constexpr (nstages <= 1) {
-            const int k0_diff = min(k0_stop, DKQ/2) - k0_start; // Only load the real head size from global memory.
+            const int k0_diff = (DKQp == DKQ ? k0_stop : min(k0_stop, DKQ/2)) - k0_start; // Only load the real head size from global memory.
             constexpr bool use_cp_async = nstages == 1;
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
@@ -1034,7 +1034,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     (mask_h, tile_mask, stride_mask, kb0_next*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
             }
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2, tile_K, min(nbatch_K2, DKQ/2), stride_K, kb0_next*nbatch_fa, k_VKQ_sup, indices);
+                (K_h2, tile_K, (DKQp == DKQ ? nbatch_K2 : min(nbatch_K2, DKQ/2)), stride_K, kb0_next*nbatch_fa, k_VKQ_sup, indices);
         }
     }
 
@@ -1046,7 +1046,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int i0_stop = i0_start + 2*nbatch_V2;
 
         if constexpr (nstages <= 1) {
-            const int i0_diff = min(i0_stop, DV) - i0_start; // Only load the real head size from global memory.
+            const int i0_diff = (DVp == DV ? i0_stop : min(i0_stop, DV)) - i0_start; // Only load the real head size from global memory.
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
                 flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
@@ -1460,7 +1460,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
         }
         flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (K_h2, tile_K, min(nbatch_K2, DKQ/2), stride_K, kb0*nbatch_fa, k_VKQ_sup, indices);
+            (K_h2, tile_K, (DKQp == DKQ ? nbatch_K2 : min(nbatch_K2, DKQ/2)), stride_K, kb0*nbatch_fa, k_VKQ_sup, indices);
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
@@ -1887,8 +1887,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                     for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                         const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
-                        if (DVp != DV && k00 + k >= DV/2) {
-                            continue;
+                        if constexpr (DVp != DV) {
+                            if (k00 + k >= DV/2) {
+                                continue;
+                            }
                         }
 
                         float2 dstk_val = make_float2(0.0f, 0.0f);
