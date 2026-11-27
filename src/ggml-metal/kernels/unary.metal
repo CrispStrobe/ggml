@@ -314,6 +314,37 @@ typedef decltype(kernel_swiglu<float>) kernel_swiglu_t;
 template [[host_name("kernel_swiglu_f32")]] kernel kernel_swiglu_t kernel_swiglu<float>;
 template [[host_name("kernel_swiglu_f16")]] kernel kernel_swiglu_t kernel_swiglu<half>;
 
+// SIGLU: sigmoid(x0) * x1 (gate half selected by the host via i00/i10, i.e. `swapped`). Same sigmoid
+// expression as the SIGMOID unary kernel, so it matches SIGMOID + MUL bit for bit. (CrispASR patch)
+template<typename T>
+kernel void kernel_siglu(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint2 tgpig[[threadgroup_position_in_grid]],
+        uint2 tpitg[[thread_position_in_threadgroup]],
+        uint2   ntg[[threads_per_threadgroup]],
+        uint2  ntgs[[threadgroups_per_grid]]) {
+    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
+    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
+    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
+
+    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+        const float x0 = src0_row[i0];
+        const float x1 = src1_row[i0];
+
+        const float sig = 1 / (1 + exp(-x0));
+
+        dst_row[i0] = (T)(sig*x1);
+    }
+}
+
+typedef decltype(kernel_siglu<float>) kernel_siglu_t;
+
+template [[host_name("kernel_siglu_f32")]] kernel kernel_siglu_t kernel_siglu<float>;
+template [[host_name("kernel_siglu_f16")]] kernel kernel_siglu_t kernel_siglu<half>;
+
 template<typename T>
 kernel void kernel_swiglu_oai(
         constant ggml_metal_kargs_glu & args,
