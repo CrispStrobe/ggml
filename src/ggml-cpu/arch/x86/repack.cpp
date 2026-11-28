@@ -6405,3 +6405,100 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 #endif
 }
+
+// Q8_0 weights repacked 4 rows x 8 bytes (block_q8_0x4, the layout the Arm kernels use), AVX2.
+// Per 32-value block, chunk k (8 values) of the 4 interleaved weight rows is 32 contiguous bytes; one
+// activation row's chunk k is broadcast to all four 8-byte lanes, multiplied with the sign trick
+// (exact: Q8_0 values are in [-127, 127]) and the pair sums of each lane reduced to one int32 per column.
+#if defined(__AVX2__)
+static inline __m128i q8_0_4x8_dot4(const uint8_t * GGML_RESTRICT w, const int8_t * GGML_RESTRICT a, int a_stride) {
+    __m256i acc = _mm256_setzero_si256();
+    for (int k = 0; k < 4; k++) {
+        const __m256i wk = _mm256_loadu_si256((const __m256i *) (w + 32 * k));
+        int64_t ak;
+        memcpy(&ak, a + a_stride * k, sizeof(ak));
+        acc = mul_sum_i8_pairs_acc_int32x8(acc, wk, _mm256_set1_epi64x(ak));
+    }
+    // lanes (2j, 2j+1) hold column j's two partial sums
+    return _mm_hadd_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+}
+#endif
+
+void ggml_gemv_q8_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX2__)
+    const int nb = n / QK8_0;
+    assert(nr == 1);
+    assert(n % QK8_0 == 0);
+    assert(nc % 4 == 0);
+    UNUSED(bs);
+    UNUSED(nr);
+    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+    for (int x = 0; x < nc / 4; x++) {
+        const block_q8_0x4 * b_ptr = (const block_q8_0x4 *) vx + (x * nb);
+        __m128 acc = _mm_setzero_ps();
+        for (int l = 0; l < nb; l++) {
+            const __m128i isum = q8_0_4x8_dot4((const uint8_t *) b_ptr[l].qs, a_ptr[l].qs, 8);
+            const __m128 dw = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *) b_ptr[l].d));
+            const __m128 scale = _mm_mul_ps(dw, _mm_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[l].d)));
+            acc = _mm_fmadd_ps(_mm_cvtepi32_ps(isum), scale, acc);
+        }
+        _mm_storeu_ps(s + x * 4, acc);
+    }
+    return;
+#endif
+    ggml_gemv_q8_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_q8_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX2__)
+    const int nb = n / QK8_0;
+    assert(n % QK8_0 == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 4 == 0);
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
+        for (int x = 0; x < nc / 4; x++) {
+            const block_q8_0x4 * b_ptr = (const block_q8_0x4 *) vx + (x * nb);
+            __m128 acc[4] = { _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps() };
+            for (int l = 0; l < nb; l++) {
+                const uint8_t * w = (const uint8_t *) b_ptr[l].qs;
+                const __m128 dw = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *) b_ptr[l].d));
+                float da[4];
+                _mm_storeu_ps(da, _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *) a_ptr[l].d)));
+                // sign trick with the weights as the unsigned side: |w| once per chunk for all 4 rows
+                __m256i aw[4], wk[4];
+                for (int k = 0; k < 4; k++) {
+                    wk[k] = _mm256_loadu_si256((const __m256i *) (w + 32 * k));
+                    aw[k] = _mm256_sign_epi8(wk[k], wk[k]);
+                }
+                __m256i isum[4];
+                for (int m = 0; m < 4; m++) {
+                    // activation row m, chunk k at qs[32 k + 8 m]
+                    __m256i a = _mm256_setzero_si256();
+                    for (int k = 0; k < 4; k++) {
+                        int64_t ak;
+                        memcpy(&ak, a_ptr[l].qs + 32 * k + 8 * m, sizeof(ak));
+                        a = mul_sum_us8_pairs_acc_int32x8(a, aw[k], _mm256_sign_epi8(_mm256_set1_epi64x(ak), wk[k]));
+                    }
+                    isum[m] = a;
+                }
+                // two rows per 256-bit reduction: hadd gives [r c0 c1, r+1 c0 c1 | r c2 c3, r+1 c2 c3]
+                const __m256 dw2 = _mm256_set_m128(dw, dw);
+                for (int m = 0; m < 4; m += 2) {
+                    const __m256i h = _mm256_permute4x64_epi64(_mm256_hadd_epi32(isum[m], isum[m + 1]), 0xD8);
+                    // h = [r c0 c1 c2 c3 | r+1 c0 c1 c2 c3]
+                    const __m256 sc = _mm256_mul_ps(dw2, _mm256_set_m128(_mm_set1_ps(da[m + 1]), _mm_set1_ps(da[m])));
+                    const __m256 v = _mm256_mul_ps(_mm256_cvtepi32_ps(h), sc);
+                    acc[m] = _mm_add_ps(acc[m], _mm256_castps256_ps128(v));
+                    acc[m + 1] = _mm_add_ps(acc[m + 1], _mm256_extractf128_ps(v, 1));
+                }
+            }
+            for (int m = 0; m < 4; m++) {
+                _mm_storeu_ps(s + (y * 4 + m) * bs + x * 4, acc[m]);
+            }
+        }
+    }
+    return;
+#endif
+    ggml_gemm_q8_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
